@@ -687,7 +687,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "tests\Test-ModSync.ps1"
 | `icon.ico` | 图标源文件，打包时会被自动嵌入 |
 | `tests\Test-ModSync.ps1` | 纯逻辑单元测试（零依赖，见「七·五」） |
 | `docs\打包exe.md` | 打包原理、重新构建步骤、换图标、可移植性检查 |
+| `LICENSE` | MIT 许可证 |
 
 程序运行时还会在本机 `%LOCALAPPDATA%\McModSync\` 下产生：
 `config.json`（路径配置 + 遗忘列表 + 可选的 CurseForge Key）、`ModSync.log`（日志）、
 `linkcache.json`（「打开在线页面」解析出来的精确链接缓存，可随时删除）。
+
+---
+
+## 九、许可
+
+本项目采用 **MIT License**，见 [LICENSE](LICENSE)。你可以自由使用、修改、再分发，
+包括商用；只需要保留版权声明和许可证原文。
+
+> **与 Mojang / Microsoft 无关。** 本工具只是一个本地文件同步器，
+> 不包含、不修改、也不分发任何 Minecraft 游戏代码或资源；
+> Minecraft 是 Mojang Studios / Microsoft 的商标。
+

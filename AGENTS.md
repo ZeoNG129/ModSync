@@ -42,6 +42,7 @@ E:\MC\software\ModSync\
 ├─ tests\Test-ModSync.ps1 纯逻辑单元测试（零依赖，AST 抽函数，不弹窗）
 ├─ README.md              使用文档、判定规则、故障排查
 ├─ AGENTS.md              本文件（给 AI Agent 的项目说明）
+├─ LICENSE                MIT
 └─ docs\打包exe.md        打包原理、重新构建步骤、换图标、应急解包
 ```
 

@@ -79,6 +79,26 @@ $packedGzip = [Convert]::ToBase64String($msG.ToArray())
 $msG.Dispose()
 Write-Host ("      GZip 版（应急用）{0} 字符" -f $packedGzip.Length)
 
+# 第三份：SSH.NET —— 远程同步（简幻欢这类 SFTP 服务器）要用。
+# Windows PowerShell 5.1 / .NET Framework 里没有任何内置 SFTP 客户端，只能把这个库带上。
+# 注意这里走 csc 的 /resource 以**压缩后的二进制资源**嵌入，而不是像脚本那样塞进 C# 字符串常量：
+# .NET 的字符串常量在程序集里按 UTF-16 存，476K 字符要占 953 KB，白白翻一倍。
+$sshDllPath = Join-Path $here 'lib\Renci.SshNet.dll'
+$sshResFile = $null
+if (Test-Path -LiteralPath $sshDllPath) {
+    if (-not (Test-Path -LiteralPath $tmpDir)) { New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null }
+    $dllBytes = [System.IO.File]::ReadAllBytes($sshDllPath)
+    $sshResFile = Join-Path $tmpDir 'sshnet.bin'
+    $fsD = [System.IO.File]::Create($sshResFile)
+    $dsD = New-Object System.IO.Compression.DeflateStream($fsD, [System.IO.Compression.CompressionMode]::Compress)
+    $dsD.Write($dllBytes, 0, $dllBytes.Length)
+    $dsD.Close()
+    $fsD.Dispose()
+    Write-Host ("      内嵌 SSH.NET：{0:N0} 字节 -> Deflate 后 {1:N0} 字节" -f $dllBytes.Length, (Get-Item -LiteralPath $sshResFile).Length)
+} else {
+    Write-Host "      没找到 lib\Renci.SshNet.dll —— 打出来的 exe 将不支持 SFTP 远程同步" -ForegroundColor Yellow
+}
+
 # 自检：启动器绝不能把脚本塞进命令行
 $cmdLineLen = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptText)).Length
 if ($cmdLineLen -gt 32767) {
@@ -112,6 +132,12 @@ static class ModSyncLauncher
     // GZipStream 解出来应急执行（做法见 README）
     const string PackedScriptGzipB64 =
 "__PACKED_SCRIPT_GZIP__";
+
+    // 内嵌的 SSH.NET（SFTP 客户端库）不在字符串常量里，而是以「Deflate 压缩后的二进制资源」
+    // 形式嵌进来的，资源名 sshnet.bin。Windows PowerShell 5.1 没有内置 SFTP，
+    // 远程同步（简幻欢等托管平台）全靠它。运行时解压成临时 .dll，
+    // 路径通过环境变量 MODSYNC_SSHNET_DLL 交给脚本；脚本按需加载，纯本地用户不受影响。
+    const string SshNetResourceName = "sshnet.bin";
 
     // 手工封装单条目 ICO（PNG-in-ICO，Vista+ 支持）。
     // 这样 PowerShell 端可以用标准的 System.Drawing.Icon 读取，不必依赖 PNG 转 Icon 的 API。
@@ -178,13 +204,43 @@ static class ModSyncLauncher
                 try { if (File.GetLastWriteTime(stale) < DateTime.Now.AddHours(-1)) { File.Delete(stale); } }
                 catch { }
             }
+            foreach (string stale in Directory.GetFiles(Path.GetTempPath(), "McModSync_sshnet_*.dll"))
+            {
+                try { if (File.GetLastWriteTime(stale) < DateTime.Now.AddHours(-1)) { File.Delete(stale); } }
+                catch { }
+            }
         }
         catch { }
 
         string tmpIconPng = null;
+        string tmpSshDll = null;
         try
         {
             File.WriteAllText(tmpScript, script, new UTF8Encoding(true));
+
+            // 解出内嵌的 SSH.NET（SFTP 用）。它是 Deflate 压缩后的二进制资源（sshnet.bin），
+            // 解不出来也不影响本地同步，只是脚本里 Initialize-SshNet 会报"找不到 Renci.SshNet.dll"。
+            try
+            {
+                Assembly asmSsh = Assembly.GetExecutingAssembly();
+                string sshRes = null;
+                foreach (string rn in asmSsh.GetManifestResourceNames())
+                {
+                    if (rn.EndsWith(SshNetResourceName, StringComparison.OrdinalIgnoreCase)) { sshRes = rn; break; }
+                }
+                if (sshRes != null)
+                {
+                    tmpSshDll = Path.Combine(Path.GetTempPath(),
+                        "McModSync_sshnet_" + Guid.NewGuid().ToString("N") + ".dll");
+                    using (Stream s = asmSsh.GetManifestResourceStream(sshRes))
+                    using (DeflateStream deflate = new DeflateStream(s, CompressionMode.Decompress))
+                    using (FileStream fs = new FileStream(tmpSshDll, FileMode.Create, FileAccess.Write))
+                    {
+                        deflate.CopyTo(fs);
+                    }
+                }
+            }
+            catch { tmpSshDll = null; }
 
             // 把嵌入的完整多尺寸图标导出成临时 ICO，供脚本设置为窗口/任务栏图标。
             // 不用 Icon.ExtractAssociatedIcon：它只能返回 32x32。
@@ -245,6 +301,7 @@ static class ModSyncLauncher
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             if (tmpIconPng != null) { psi.EnvironmentVariables["MODSYNC_ICON_ICO"] = tmpIconPng; }
+            if (tmpSshDll != null) { psi.EnvironmentVariables["MODSYNC_SSHNET_DLL"] = tmpSshDll; }
 
             Process proc = Process.Start(psi);
             proc.WaitForExit();
@@ -260,8 +317,9 @@ static class ModSyncLauncher
         }
         finally
         {
-            try { if (File.Exists(tmpScript)) { File.Delete(tmpScript); } }
-            catch { }
+            try { if (File.Exists(tmpScript)) { File.Delete(tmpScript); } } catch { }
+            // SSH.NET 的 dll 也要等子进程退出后再删（子进程可能还映射着它）
+            try { if (tmpSshDll != null && File.Exists(tmpSshDll)) { File.Delete(tmpSshDll); } } catch { }
         }
     }
 }
@@ -306,6 +364,10 @@ if (Test-Path -LiteralPath $iconFile) {
 # 把多尺寸图标作为嵌入资源打进 exe（资源名必须与启动器里查找的名字一致）
 if ($embedIcon -and (Test-Path -LiteralPath $embedIcon)) {
     [void]$cscArgs.Add('/resource:' + $embedIcon + ',appicon.ico')
+}
+# 内嵌 SSH.NET（Deflate 压缩后的二进制资源，见上文；启动器按 sshnet.bin 查找）
+if ($sshResFile -and (Test-Path -LiteralPath $sshResFile)) {
+    [void]$cscArgs.Add('/resource:' + $sshResFile + ',sshnet.bin')
 }
 [void]$cscArgs.Add('/out:' + $outExe)
 [void]$cscArgs.Add($csFile)

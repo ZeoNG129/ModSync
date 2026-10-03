@@ -2,19 +2,23 @@
 ================================================================================
  ModSync.ps1  --  Minecraft 整合包 客户端/服务端 mod 同步工具
 --------------------------------------------------------------------------------
- 零依赖：仅使用 Windows 自带 PowerShell 5.1 + .NET WinForms，无需安装任何环境。
+ 零安装：只用 Windows 自带的 PowerShell 5.1 + .NET WinForms，
+         远程同步所需的 SFTP 客户端库（SSH.NET，MIT）已内嵌进 exe，用户不用装任何东西。
 
  功能：
-   1. 路径配置：客户端 / 服务端 mods 文件夹可手动填写或对话框选择，配置自动保存。
-   2. 变更检测：扫描并比对，列出「新增 / 更新 / 已同步 / 仅服务端有」四类状态。
-   3. 选择性同步：在列表中勾选，一键复制到服务端并覆盖旧版本。
+   1. 路径配置：客户端 mods 文件夹 + 同步目标（本地/网络文件夹，或 SFTP 远程服务器）。
+   2. 变更检测：扫描并比对，列出「新增 / 更新 / 已同步 / 重命名」四类状态。
+   3. 选择性同步：在列表中勾选，一键复制到目标端并覆盖旧版本。
    4. 安全提示：同步前弹出明细，列出"将新增 / 将覆盖 / 将删除"的每个文件；
       执行后逐行回填成功/失败结果，末尾给出汇总。
+   5. 远程同步：目标端可以是简幻欢这类托管平台的 SFTP（详见 lib\README.md）。
 
- 判定"是否更新"的依据（三级递进，兼顾准确与速度）：
-   第 1 级 文件名剥版本 + 大小比对  -> 99% 的情况在这里就判定完毕，不读文件内容
+ 判定"是否更新"的依据（四级递进，兼顾准确与速度）：
+   第 1 级 文件名剥版本 + 大小比对  -> 绝大多数情况在这里就判定完毕，不读文件内容
    第 2 级 同名且同大小时才计算 MD5 -> 区分"真的一致"和"同大小不同内容"
    第 3 级 文件名不同但 mod 同名    -> 识别为版本更替，标记旧文件为「将删除」
+   第 4 级 内容一致、仅文件名不同    -> 判为「重命名」，让目标端改名而不是新增
+   （SFTP 目标端的 MD5 走服务器上的 md5sum，不会把整个整合包下载下来）
 ================================================================================
 #>
 
@@ -84,6 +88,32 @@ function Get-DefaultProfileName {
     return ('整合包 ' + (@($script:Config.Profiles).Count + 1))
 }
 
+# 统一构造「配置档」对象：字段必须齐全，缺的补默认值。
+# 三处会用到（读配置时的规范化、旧配置迁移、兜底空档），集中在这里就不会漏字段 ——
+# 漏一个字段的后果是 Set-CurProfileField 静默失败，用户改了设置却没保存。
+function New-ProfileObject($p) {
+    $port = 22
+    if ($p -and $p.SftpPort) { try { $port = [int]$p.SftpPort } catch { $port = 22 } }
+    if ($port -lt 1 -or $port -gt 65535) { $port = 22 }
+    $kind = 'Local'
+    if ($p -and [string]$p.TargetKind -eq 'Sftp') { $kind = 'Sftp' }
+    return [pscustomobject]@{
+        Id          = $(if ($p -and $p.Id) { [string]$p.Id } else { [guid]::NewGuid().ToString('N') })
+        Name        = $(if ($p -and $p.Name) { [string]$p.Name } else { '未命名' })
+        ClientDir   = $(if ($p) { [string]$p.ClientDir } else { '' })
+        ServerDir   = $(if ($p) { [string]$p.ServerDir } else { '' })
+        # ---- 同步目标：Local = 本地/网络共享文件夹；Sftp = 远程服务器（简幻欢等）----
+        TargetKind  = $kind
+        SftpHost    = $(if ($p) { [string]$p.SftpHost } else { '' })
+        SftpPort    = $port
+        SftpUser    = $(if ($p) { [string]$p.SftpUser } else { '' })
+        SftpPass    = $(if ($p) { [string]$p.SftpPass } else { '' })   # 只存本机 config.json，绝不进项目/日志/界面明文
+        SftpDir     = $(if ($p) { [string]$p.SftpDir } else { '' })
+        IgnoredMods = $(if ($p) { @($p.IgnoredMods | Where-Object { $_ }) } else { @() })
+        IgnoredInfo = $(if ($p) { @($p.IgnoredInfo | Where-Object { $_ }) } else { @() })
+    }
+}
+
 $script:Records = @()      # 客户端扫描结果（已应用遗忘过滤）
 $script:AllRecords = @()   # 客户端扫描结果（未过滤，供遗忘管理用）
 $script:IgnoredCount = 0   # 本次扫描被遗忘过滤掉的数量
@@ -96,6 +126,7 @@ $script:ScanInProgress = $false   # 防重入：扫描期间挡掉新的扫描�
 $script:CancelScan = $false       # 允许用户中断扫描
 $script:PendingWatchStart = $false
 $script:IgnoreProfileEvent = $false   # 填充配置档下拉框时抑制切换事件
+$script:IgnoreTargetEvent = $false    # 填充「同步目标类型」下拉框时抑制切换事件
 $script:AutoRenameBusy = $false       # 自动重命名进行中：防止重扫嵌套时反复改名
 $script:AutoRenameNote = ''           # 自动重命名的结果提示，交给状态栏显示一次
 $script:LastScanOk = $false           # 本次会话是否成功扫描过一次：退出日志靠它区分"没扫成"和"扫了但没变更"
@@ -162,18 +193,11 @@ function Read-Cfg {
                 if ($null -ne $obj.$k) { $script:Config[$k] = $obj.$k }
             }
 
-            # 规范化：Profiles 必须是数组，字段必须齐全
+            # 规范化：Profiles 必须是数组，字段必须齐全（含新增的 SFTP 字段，老配置缺了要补默认值）
             $norm = New-Object System.Collections.ArrayList
             foreach ($p in @($script:Config.Profiles)) {
                 if (-not $p) { continue }
-                [void]$norm.Add([pscustomobject]@{
-                    Id         = $(if ($p.Id) { [string]$p.Id } else { [guid]::NewGuid().ToString('N') })
-                    Name       = $(if ($p.Name) { [string]$p.Name } else { '未命名' })
-                    ClientDir  = [string]$p.ClientDir
-                    ServerDir  = [string]$p.ServerDir
-                    IgnoredMods = @($p.IgnoredMods | Where-Object { $_ })
-                    IgnoredInfo = @($p.IgnoredInfo | Where-Object { $_ })
-                })
+                [void]$norm.Add((New-ProfileObject $p))
             }
             $script:Config.Profiles = @($norm)
 
@@ -185,14 +209,14 @@ function Read-Cfg {
                 $nm = '默认整合包'
                 try { if ($legacyClient) { $nm = Split-Path (Split-Path $legacyClient -Parent) -Leaf } } catch { }
                 if (-not $nm) { $nm = '默认整合包' }
-                $script:Config.Profiles = @([pscustomobject]@{
+                $script:Config.Profiles = @(New-ProfileObject ([pscustomobject]@{
                     Id          = [guid]::NewGuid().ToString('N')
                     Name        = $nm
                     ClientDir   = $legacyClient
                     ServerDir   = $legacyServer
                     IgnoredMods = @($obj.IgnoredMods | Where-Object { $_ })
                     IgnoredInfo = @($obj.IgnoredInfo | Where-Object { $_ })
-                })
+                }))
                 Write-Log ('已把旧配置迁移为配置档「{0}」（含 {1} 个遗忘项）' -f $nm, @($obj.IgnoredMods).Count)
             }
             # 迁移后清掉旧字段，避免下次保存又把它们写回去
@@ -209,10 +233,7 @@ function Read-Cfg {
     }
     # 兜底：至少有一个配置档，界面才有东西可操作
     if (@($script:Config.Profiles).Count -eq 0) {
-        $script:Config.Profiles = @([pscustomobject]@{
-            Id = [guid]::NewGuid().ToString('N'); Name = '默认整合包'
-            ClientDir = ''; ServerDir = ''; IgnoredMods = @(); IgnoredInfo = @()
-        })
+        $script:Config.Profiles = @(New-ProfileObject ([pscustomobject]@{ Name = '默认整合包' }))
         $script:Config.CurrentProfile = 0
     }
 }
@@ -436,6 +457,186 @@ function Select-Folder([string]$title, [string]$initial) {
     return $null
 }
 
+# ------------------------------------------------------------------ 同步目标 UI
+
+# 端口文本框 → 整数（非法就退回默认 22）
+function ConvertTo-PortOrDefault([string]$s, [int]$default = 22) {
+    $n = 0
+    if ([int]::TryParse(([string]$s).Trim(), [ref]$n) -and $n -ge 1 -and $n -le 65535) { return $n }
+    return $default
+}
+
+# 目标类型切换时更新界面：按钮文案 + 输入框提示
+function Update-TargetUI {
+    if (-not $cboTargetKind) { return }
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        $btnServer.Text = 'SFTP 设置...'
+        $tipTarget.SetToolTip($txtServer, "远程服务器上的 mods 目录，例如 /mods 或 /home/container/mods`n点右边「SFTP 设置...」填主机 / 端口 / 用户名 / 密码。")
+    } else {
+        $btnServer.Text = '浏览...'
+        $tipTarget.SetToolTip($txtServer, '服务端 mods 文件夹路径。局域网/共享目录可以填 \\192.168.1.100\mcserver\mods')
+    }
+}
+
+# 把界面上的同步目标写回当前配置档（切档 / 新增档 / 关窗之前都要做）
+function Save-TargetFromUI {
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        Set-CurProfileField 'TargetKind' 'Sftp'
+        Set-CurProfileField 'SftpDir' (Normalize-RemoteDir $txtServer.Text)
+    } else {
+        Set-CurProfileField 'TargetKind' 'Local'
+        Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+    }
+}
+
+# 界面上是否已经具备可扫描的目标端（决定启动/切档后要不要自动扫描）
+function Test-TargetConfigured {
+    if ([string]::IsNullOrWhiteSpace($txtServer.Text)) { return $false }
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        $p = Get-CurProfile
+        return (-not [string]::IsNullOrWhiteSpace([string]$p.SftpHost))
+    }
+    return $true
+}
+
+# 从当前配置档拼一个 SFTP 目标（对话框里改完字段后用它去测试连接）
+function New-SftpTargetFrom([string]$host, [string]$port, [string]$user, [string]$pass, [string]$dir) {
+    return [pscustomobject]@{
+        Kind = 'Sftp'
+        Host = ([string]$host).Trim()
+        Port = (ConvertTo-PortOrDefault $port 22)
+        User = ([string]$user).Trim()
+        Pass = [string]$pass
+        Dir  = (Normalize-RemoteDir $dir)
+    }
+}
+
+# SFTP 设置对话框。确定返回 @{Host;Port;User;Pass}，取消返回 $null。
+function Show-SftpDialog {
+    $p = Get-CurProfile
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'SFTP 设置 —— 远程服务器'
+    $dlg.Size = New-Object System.Drawing.Size(600, 372)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimizeBox = $false
+    $dlg.MaximizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    if ($form.Icon) { $dlg.Icon = $form.Icon }
+
+    $l1 = New-Object System.Windows.Forms.Label
+    $l1.Text = '主机：'
+    $l1.Location = New-Object System.Drawing.Point(14, 18)
+    $l1.Size = New-Object System.Drawing.Size(80, 22)
+    $l1.TextAlign = 'MiddleRight'
+    $txtHost = New-Object System.Windows.Forms.TextBox
+    $txtHost.Location = New-Object System.Drawing.Point(98, 18)
+    $txtHost.Size = New-Object System.Drawing.Size(300, 24)
+    $txtHost.Text = [string]$p.SftpHost
+
+    $l2 = New-Object System.Windows.Forms.Label
+    $l2.Text = '端口：'
+    $l2.Location = New-Object System.Drawing.Point(406, 18)
+    $l2.Size = New-Object System.Drawing.Size(52, 22)
+    $l2.TextAlign = 'MiddleRight'
+    $txtPort = New-Object System.Windows.Forms.TextBox
+    $txtPort.Location = New-Object System.Drawing.Point(462, 18)
+    $txtPort.Size = New-Object System.Drawing.Size(110, 24)
+    $txtPort.Text = [string]$(if ($p.SftpPort) { $p.SftpPort } else { 22 })
+
+    $l3 = New-Object System.Windows.Forms.Label
+    $l3.Text = '用户名：'
+    $l3.Location = New-Object System.Drawing.Point(14, 54)
+    $l3.Size = New-Object System.Drawing.Size(80, 22)
+    $l3.TextAlign = 'MiddleRight'
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Location = New-Object System.Drawing.Point(98, 54)
+    $txtUser.Size = New-Object System.Drawing.Size(300, 24)
+    $txtUser.Text = [string]$p.SftpUser
+
+    $l4 = New-Object System.Windows.Forms.Label
+    $l4.Text = '密码：'
+    $l4.Location = New-Object System.Drawing.Point(14, 90)
+    $l4.Size = New-Object System.Drawing.Size(80, 22)
+    $l4.TextAlign = 'MiddleRight'
+    $txtPass = New-Object System.Windows.Forms.TextBox
+    $txtPass.Location = New-Object System.Drawing.Point(98, 90)
+    $txtPass.Size = New-Object System.Drawing.Size(300, 24)
+    $txtPass.UseSystemPasswordChar = $true
+    $txtPass.Text = [string]$p.SftpPass
+
+    $l5 = New-Object System.Windows.Forms.Label
+    $l5.Text = '远程目录：'
+    $l5.Location = New-Object System.Drawing.Point(14, 126)
+    $l5.Size = New-Object System.Drawing.Size(80, 22)
+    $l5.TextAlign = 'MiddleRight'
+    $txtDir = New-Object System.Windows.Forms.TextBox
+    $txtDir.Location = New-Object System.Drawing.Point(98, 126)
+    $txtDir.Size = New-Object System.Drawing.Size(474, 24)
+    $txtDir.Text = [string]$p.SftpDir
+
+    $l6 = New-Object System.Windows.Forms.Label
+    $l6.Location = New-Object System.Drawing.Point(14, 156)
+    $l6.Size = New-Object System.Drawing.Size(558, 22)
+    $l6.ForeColor = [System.Drawing.Color]::FromArgb(110, 115, 122)
+    $l6.Text = '远程目录就是面板文件管理器里那个 mods 文件夹。不确定就先留空，点「测试连接」会列出登录后的目录。'
+
+    $txtOut = New-Object System.Windows.Forms.TextBox
+    $txtOut.Location = New-Object System.Drawing.Point(14, 182)
+    $txtOut.Size = New-Object System.Drawing.Size(558, 108)
+    $txtOut.Multiline = $true
+    $txtOut.ReadOnly = $true
+    $txtOut.ScrollBars = 'Vertical'
+    $txtOut.BackColor = [System.Drawing.Color]::White
+    $txtOut.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+
+    $btnTest = New-Object System.Windows.Forms.Button
+    $btnTest.Text = '测试连接'
+    $btnTest.Location = New-Object System.Drawing.Point(14, 298)
+    $btnTest.Size = New-Object System.Drawing.Size(110, 30)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = '确定'
+    $btnOk.Location = New-Object System.Drawing.Point(348, 298)
+    $btnOk.Size = New-Object System.Drawing.Size(108, 30)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消'
+    $btnCancel.Location = New-Object System.Drawing.Point(464, 298)
+    $btnCancel.Size = New-Object System.Drawing.Size(108, 30)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $dlg.Controls.AddRange(@($l1, $txtHost, $l2, $txtPort, $l3, $txtUser, $l4, $txtPass,
+                            $l5, $txtDir, $l6, $txtOut, $btnTest, $btnOk, $btnCancel))
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    $btnTest.Add_Click({
+        $btnTest.Enabled = $false
+        $txtOut.Text = '正在连接...'
+        [System.Windows.Forms.Application]::DoEvents()
+        $t = New-SftpTargetFrom $txtHost.Text $txtPort.Text $txtUser.Text $txtPass.Text $txtDir.Text
+        $r = Test-TargetConnection $t
+        $txtOut.Text = $r.Text
+        $btnTest.Enabled = $true
+    })
+
+    $ret = $dlg.ShowDialog($form)
+    if ($ret -ne [System.Windows.Forms.DialogResult]::OK) { $dlg.Dispose(); return $null }
+    $out = @{
+        Host = $txtHost.Text.Trim()
+        Port = (ConvertTo-PortOrDefault $txtPort.Text 22)
+        User = $txtUser.Text.Trim()
+        Pass = [string]$txtPass.Text
+        Dir  = (Normalize-RemoteDir $txtDir.Text)
+    }
+    $dlg.Dispose()
+    return $out
+}
+
 # ------------------------------------------------------------------ 界面构建
 
 # 主线程定时器：负责「延迟挂载文件监控」与「文件变动后的防抖重扫」
@@ -607,14 +808,24 @@ $btnClient.Size = New-Object System.Drawing.Size(104, 26)
 $btnClient.Anchor = 'Top,Right'
 
 $lblS = New-Object System.Windows.Forms.Label
-$lblS.Text = '服务端 mods：'
+$lblS.Text = '同步目标：'
 $lblS.Location = New-Object System.Drawing.Point(14, 95)
 $lblS.Size = New-Object System.Drawing.Size(94, 22)
 $lblS.TextAlign = 'MiddleRight'
 
+# 同步目标类型：本地/网络文件夹，或 SFTP 远程服务器（简幻欢这类托管平台给的就是 SFTP）
+$cboTargetKind = New-Object System.Windows.Forms.ComboBox
+$cboTargetKind.DropDownStyle = 'DropDownList'
+$cboTargetKind.Location = New-Object System.Drawing.Point(112, 95)
+$cboTargetKind.Size = New-Object System.Drawing.Size(150, 24)
+$cboTargetKind.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+[void]$cboTargetKind.Items.Add('本地 / 网络文件夹')
+[void]$cboTargetKind.Items.Add('SFTP 远程服务器')
+$cboTargetKind.SelectedIndex = 0
+
 $txtServer = New-Object System.Windows.Forms.TextBox
-$txtServer.Location = New-Object System.Drawing.Point(112, 95)
-$txtServer.Size = New-Object System.Drawing.Size(900, 24)
+$txtServer.Location = New-Object System.Drawing.Point(270, 95)
+$txtServer.Size = New-Object System.Drawing.Size(742, 24)
 $txtServer.Anchor = 'Top,Left,Right'
 
 $btnServer = New-Object System.Windows.Forms.Button
@@ -622,6 +833,9 @@ $btnServer.Text = '浏览...'
 $btnServer.Location = New-Object System.Drawing.Point(1020, 94)
 $btnServer.Size = New-Object System.Drawing.Size(104, 26)
 $btnServer.Anchor = 'Top,Right'
+
+$tipTarget = New-Object System.Windows.Forms.ToolTip
+$tipTarget.SetToolTip($txtServer, '服务端 mods 文件夹路径。局域网/共享目录可以填 \\192.168.1.100\mcserver\mods')
 
 $chkHash = New-Object System.Windows.Forms.CheckBox
 $chkHash.Text = '启用 MD5 精确校验（更准，稍慢）'
@@ -665,7 +879,7 @@ $tipCfKey = New-Object System.Windows.Forms.ToolTip
 $tipCfKey.SetToolTip($txtCfKey, "可选。填了才能一键直达 CurseForge 的 mod 页面（用文件指纹精确匹配）。`n申请地址：https://console.curseforge.com/`n只保存在本机配置文件里。")
 
 $grpPath.Controls.AddRange(@($lblProfile, $cboProfile, $btnProfAdd, $btnProfRename, $btnProfDel,
-                            $lblC, $txtClient, $btnClient, $lblS, $txtServer, $btnServer,
+                            $lblC, $txtClient, $btnClient, $lblS, $cboTargetKind, $txtServer, $btnServer,
                             $chkHash, $chkWatch, $chkBackup, $chkRename, $lblCfKey, $txtCfKey))
 
 # --- 工具栏 ---
@@ -862,10 +1076,19 @@ $menuGrid.Add_Opening({
     if (-not $script:MenuRec -and $grid.SelectedRows.Count -gt 0) { $script:MenuRec = $grid.SelectedRows[0].Tag }
     if (-not $script:MenuRec) { $e.Cancel = $true; return }
     $srv = Get-ServerFileForRecord $script:MenuRec
-    $miOpenServer.Enabled = [bool]$srv
-    $miOpenServer.ToolTipText = $(if ($srv) { $srv } else { '服务端没有这个 mod 的对应文件' })
-    $miCopyServerPath.Enabled = [bool]$srv
-    $miOpenServerDir.Enabled = [bool](Resolve-InputPath $txtServer.Text)
+    $isSftp = ($cboTargetKind.SelectedIndex -eq 1)
+    if ($isSftp) {
+        # 远程路径没法用资源管理器"定位"，这两项灰掉；复制路径仍然可用
+        $miOpenServer.Enabled = $false
+        $miOpenServer.ToolTipText = '远程（SFTP）服务器上的文件，资源管理器定位不了；用「复制 ▸ 服务端完整路径」'
+        $miOpenServerDir.Enabled = $false
+        $miCopyServerPath.Enabled = [bool]$srv
+    } else {
+        $miOpenServer.Enabled = [bool]$srv
+        $miOpenServer.ToolTipText = $(if ($srv) { $srv } else { '服务端没有这个 mod 的对应文件' })
+        $miCopyServerPath.Enabled = [bool]$srv
+        $miOpenServerDir.Enabled = [bool](Resolve-InputPath $txtServer.Text)
+    }
 
     # 「批量重命名」要勾选 ≥2 个才有意义，没勾够就灰掉并说明怎么用
     $nChecked = @($grid.Rows | Where-Object { $_.Tag -and [bool]$_.Cells[0].Value }).Count
@@ -1007,7 +1230,24 @@ function Load-CurrentProfileToUI {
     $p = Get-CurProfile
     if (-not $p) { return }
     $txtClient.Text = $(if ($p.ClientDir) { Get-DisplayPath $p.ClientDir } else { '' })
-    $txtServer.Text = $(if ($p.ServerDir) { Get-DisplayPath $p.ServerDir } else { '' })
+    # 目标类型决定这个框里放什么：本地路径（缩写显示）还是远程目录。
+    # 程序化改下拉框会触发 SelectedIndexChanged，用标志位压掉，否则会来回互相覆盖。
+    $script:IgnoreTargetEvent = $true
+    try {
+        if ([string]$p.TargetKind -eq 'Sftp') {
+            $cboTargetKind.SelectedIndex = 1
+            $txtServer.Text = [string]$p.SftpDir
+        } else {
+            $cboTargetKind.SelectedIndex = 0
+            $txtServer.Text = $(if ($p.ServerDir) { Get-DisplayPath $p.ServerDir } else { '' })
+        }
+    } finally {
+        $script:IgnoreTargetEvent = $false
+    }
+    Update-TargetUI
+    # 切了配置档，之前解析好的目标端作废
+    $script:ActiveTarget = $null
+    Disconnect-SftpTarget
 }
 
 function Switch-Profile([int]$idx) {
@@ -1016,21 +1256,21 @@ function Switch-Profile([int]$idx) {
 
     # 先保存当前档的路径，再切过去
     Set-CurProfileField 'ClientDir' (Resolve-InputPath $txtClient.Text)
-    Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+    Save-TargetFromUI
     $script:Config.CurrentProfile = $idx
     Write-Cfg
     Load-CurrentProfileToUI
     $script:IgnoredCount = 0
-    Write-Log ('切换配置档 -> 「{0}」 | 客户端={1} | 服务端={2}' -f (Get-CurProfile).Name, (Get-CurClientDir), (Get-CurServerDir))
+    Write-Log ('切换配置档 -> 「{0}」 | 客户端={1} | 目标={2}' -f (Get-CurProfile).Name, (Get-CurClientDir), (Get-TargetLabel (Get-CurTarget)))
 
     # 换文件夹后监控要重挂，随即重新扫描
     try { if ($script:Watcher) { $script:Watcher.Dispose(); $script:Watcher = $null } } catch { }
     $script:WatcherDir = ''
     $script:PendingWatchStart = $true
-    if ($txtClient.Text -and $txtServer.Text) {
+    if ($txtClient.Text -and (Test-TargetConfigured)) {
         Invoke-Scan
     } else {
-        $lblStatus.Text = '该配置档还没设置文件夹路径，请先选择'
+        $lblStatus.Text = '该配置档还没设置好同步目标，请先选择'
     }
 }
 
@@ -1045,12 +1285,10 @@ function Add-Profile {
     }
     # 保存当前档，然后追加新档并切过去
     Set-CurProfileField 'ClientDir' (Resolve-InputPath $txtClient.Text)
-    Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+    Save-TargetFromUI
     $list = @($script:Config.Profiles)
-    $list += [pscustomobject]@{
-        Id = [guid]::NewGuid().ToString('N'); Name = $name
-        ClientDir = ''; ServerDir = ''; IgnoredMods = @(); IgnoredInfo = @()
-    }
+    # 用 New-ProfileObject 而不是手写对象：字段齐全，以后再加字段也不会漏
+    $list += (New-ProfileObject ([pscustomobject]@{ Name = $name }))
     $script:Config.Profiles = $list
     $script:Config.CurrentProfile = $list.Count - 1
     Write-Cfg
@@ -1614,6 +1852,304 @@ function Show-IgnoredManager {
 
 # ------------------------------------------------------------------ 扫描逻辑
 
+# ================================================================== 同步目标（本地 / SFTP）
+# 本工具原本只能同步到本地文件夹（或 UNC 共享）。简幻欢这类托管平台给的是 SFTP，
+# 而 Windows PowerShell 5.1 / .NET Framework 里**没有任何内置 SFTP 客户端**，
+# 所以内嵌了 SSH.NET（MIT 许可，见 lib\README.md）—— 依然是一个绿色 exe、不用装任何东西。
+#
+# 所有"目标端"操作都收在这一层：上层（扫描 / 同步 / 改名）只调下面这几个函数，
+# 完全不关心对面是本地磁盘还是远程服务器。
+
+$script:SshNetReady = $false
+$script:SshNetPath  = ''
+$script:SshNetError = ''
+
+# 惰性加载 SSH.NET：只在真的用到 SFTP 时才加载，纯本地用户一点不受影响。
+function Initialize-SshNet {
+    if ($script:SshNetReady) { return $true }
+    if ('Renci.SshNet.SftpClient' -as [type]) { $script:SshNetReady = $true; return $true }
+
+    $cand = New-Object System.Collections.ArrayList
+    if ($env:MODSYNC_SSHNET_DLL) { [void]$cand.Add($env:MODSYNC_SSHNET_DLL) }   # exe 启动器解压出来的
+    $bases = New-Object System.Collections.ArrayList
+    if ($PSScriptRoot) { [void]$bases.Add($PSScriptRoot) }
+    try { $mp = Split-Path -Parent $MyInvocation.MyCommand.Path; if ($mp) { [void]$bases.Add($mp) } } catch { }
+    foreach ($b in $bases) { [void]$cand.Add((Join-Path $b 'lib\Renci.SshNet.dll')) }   # 开发态：直接跑源码
+
+    foreach ($p in $cand) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            Add-Type -Path $p -ErrorAction Stop
+            if ('Renci.SshNet.SftpClient' -as [type]) {
+                $script:SshNetReady = $true
+                $script:SshNetPath = $p
+                return $true
+            }
+        } catch { $script:SshNetError = $_.Exception.Message }
+    }
+    if (-not $script:SshNetError) {
+        $script:SshNetError = '找不到 Renci.SshNet.dll。跑源码时它应该在 lib\ 目录下；跑 exe 时说明打包漏了。'
+    }
+    return $false
+}
+
+# 远程目录归一化：统一用 /，去掉尾部斜杠（根目录除外）
+function Normalize-RemoteDir([string]$d) {
+    if ([string]::IsNullOrWhiteSpace($d)) { return '' }
+    $d = ($d.Trim() -replace '\\', '/')
+    if ($d.Length -gt 1) { $d = $d.TrimEnd('/') }
+    if (-not $d.StartsWith('/')) { $d = '/' + $d }
+    return $d
+}
+function Join-RemotePath([string]$dir, [string]$name) {
+    if ([string]::IsNullOrEmpty($dir) -or $dir -eq '/') { return '/' + $name }
+    return $dir.TrimEnd('/') + '/' + $name
+}
+
+# 当前配置档的同步目标。Local 用 ServerDir；Sftp 用 Sftp* 字段。
+function Get-CurTarget {
+    $p = Get-CurProfile
+    if ($p -and [string]$p.TargetKind -eq 'Sftp') {
+        return [pscustomobject]@{
+            Kind = 'Sftp'
+            Host = [string]$p.SftpHost
+            Port = [int]$(if ($p.SftpPort) { $p.SftpPort } else { 22 })
+            User = [string]$p.SftpUser
+            Pass = [string]$p.SftpPass
+            Dir  = (Normalize-RemoteDir ([string]$p.SftpDir))
+        }
+    }
+    return [pscustomobject]@{
+        Kind = 'Local'; Host = ''; Port = 0; User = ''; Pass = ''
+        Dir  = (Resolve-InputPath (Get-CurServerDir))
+    }
+}
+# 目标端的一句话描述，给状态栏/日志用
+function Get-TargetLabel($t) {
+    if (-not $t) { return '(未设置)' }
+    if ($t.Kind -eq 'Sftp') { return ("SFTP {0}@{1}:{2}{3}" -f $t.User, $t.Host, $t.Port, $t.Dir) }
+    return ("本地 {0}" -f $t.Dir)
+}
+
+# 本次操作实际使用的目标端。扫描时解析好（本地路径会被归一化）放这里，
+# 下游的同步/改名逻辑统一读它，不用把 target 一路当参数传下去。
+$script:ActiveTarget = $null
+function Get-ActiveTarget {
+    if ($script:ActiveTarget) { return $script:ActiveTarget }
+    return (Get-CurTarget)
+}
+
+$script:SftpClient = $null
+$script:SshClient  = $null
+$script:SshExecOk  = $null   # $null=未探测 / $true=可执行命令 / $false=只能 SFTP
+
+function Disconnect-SftpTarget {
+    foreach ($o in @($script:SftpClient, $script:SshClient)) {
+        try { if ($o) { if ($o.IsConnected) { $o.Disconnect() }; $o.Dispose() } } catch { }
+    }
+    $script:SftpClient = $null
+    $script:SshClient  = $null
+    $script:SshExecOk  = $null
+}
+
+function Connect-SftpTarget($t) {
+    if ($script:SftpClient -and $script:SftpClient.IsConnected) { return $script:SftpClient }
+    if (-not (Initialize-SshNet)) { throw $script:SshNetError }
+    if ([string]::IsNullOrWhiteSpace($t.Host)) { throw '还没有填写 SFTP 主机地址。点「SFTP 设置...」填一下。' }
+    if ([string]::IsNullOrWhiteSpace($t.User)) { throw '还没有填写 SFTP 用户名。点「SFTP 设置...」填一下。' }
+    Disconnect-SftpTarget
+    $c = New-Object Renci.SshNet.SftpClient($t.Host, [int]$t.Port, $t.User, $t.Pass)
+    $c.ConnectionInfo.Timeout = [TimeSpan]::FromSeconds(20)
+    $c.OperationTimeout = [TimeSpan]::FromSeconds(180)
+    try { $c.Connect() } catch {
+        try { $c.Dispose() } catch { }
+        throw ("连不上 SFTP：{0}:{1} —— {2}" -f $t.Host, $t.Port, $_.Exception.Message)
+    }
+    $script:SftpClient = $c
+    return $c
+}
+
+# 独立的命令通道：用来在服务器上跑 md5sum / cp，省掉下载整个 jar 的流量。
+# 有些面板只给 SFTP 不给 shell，这里探测失败就返回 $null，上层自动退化为"只比大小"。
+function Get-SshExecSession($t) {
+    if ($script:SshExecOk -eq $false) { return $null }
+    if ($script:SshClient -and $script:SshClient.IsConnected) { return $script:SshClient }
+    if (-not (Initialize-SshNet)) { return $null }
+    try {
+        $s = New-Object Renci.SshNet.SshClient($t.Host, [int]$t.Port, $t.User, $t.Pass)
+        $s.ConnectionInfo.Timeout = [TimeSpan]::FromSeconds(20)
+        $s.Connect()
+        $r = $s.RunCommand('echo MODSYNC_OK')
+        if ($r.ExitStatus -ne 0 -or ([string]$r.Result) -notmatch 'MODSYNC_OK') {
+            try { $s.Dispose() } catch { }
+            $script:SshExecOk = $false
+            return $null
+        }
+        $script:SshClient = $s
+        $script:SshExecOk = $true
+        return $s
+    } catch {
+        $script:SshExecOk = $false
+        Write-Log ('SSH 命令通道不可用（远程哈希/服务端备份会退化）：' + $_.Exception.Message)
+        return $null
+    }
+}
+
+# shell 单引号转义：' -> '\''
+function Quote-ShArg([string]$s) {
+    return "'" + ($s -replace "'", "'\''") + "'"
+}
+
+function Get-RemoteMd5([string]$path) {
+    $s = Get-SshExecSession (Get-CurTarget)
+    if (-not $s) { return $null }
+    try {
+        $r = $s.RunCommand('md5sum -- ' + (Quote-ShArg $path))
+        if ($r.ExitStatus -ne 0) { return $null }
+        $m = [regex]::Match([string]$r.Result, '(?m)^([0-9a-fA-F]{32})\s')
+        if ($m.Success) { return $m.Groups[1].Value.ToUpper() }
+    } catch { }
+    return $null
+}
+
+# ---------------------------------------------------------------- 目标端操作（本地/SFTP 分派）
+
+# 列出目标端的 .jar。返回对象的形状与 FileInfo 一致（Name/FullName/Length/LastWriteTime），
+# 所以上层的判定逻辑一行都不用改。
+function Get-TargetJarFiles($t) {
+    if ($t.Kind -eq 'Sftp') {
+        if ([string]::IsNullOrWhiteSpace($t.Dir)) { throw '还没有填写远程 mods 目录（例如 /mods）。' }
+        $c = Connect-SftpTarget $t
+        try { $list = $c.ListDirectory($t.Dir) } catch {
+            throw ("读不到远程目录 {0} —— {1}" -f $t.Dir, $_.Exception.Message)
+        }
+        $out = New-Object System.Collections.ArrayList
+        foreach ($f in $list) {
+            if ($f.IsDirectory) { continue }
+            if (-not $f.Name.ToLower().EndsWith('.jar')) { continue }
+            [void]$out.Add([pscustomobject]@{
+                Name          = $f.Name
+                FullName      = (Join-RemotePath $t.Dir $f.Name)
+                Length        = [long]$f.Length
+                LastWriteTime = $f.LastWriteTimeUtc.ToLocalTime()
+                Remote        = $true
+            })
+        }
+        return @($out | Sort-Object Name)
+    }
+    return @(Get-ChildItem -LiteralPath $t.Dir -File -Filter '*.jar' -ErrorAction SilentlyContinue | Sort-Object Name)
+}
+
+function Test-TargetFile($t, [string]$path) {
+    if ($t.Kind -eq 'Sftp') {
+        try { return (Connect-SftpTarget $t).Exists($path) } catch { return $false }
+    }
+    return (Test-Path -LiteralPath $path)
+}
+function Get-TargetFileSize($t, [string]$path) {
+    if ($t.Kind -eq 'Sftp') { return [long](Connect-SftpTarget $t).GetAttributes($path).Size }
+    return [long](Get-Item -LiteralPath $path).Length
+}
+function Copy-LocalFileToTarget($t, [string]$src, [string]$dstPath) {
+    if ($t.Kind -eq 'Sftp') {
+        $c = Connect-SftpTarget $t
+        # 共享读打开：客户端 mods 里可能正被 PCL2 之类读着
+        $fs = [System.IO.File]::Open($src, [System.IO.FileMode]::Open,
+              [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { $c.UploadFile($fs, $dstPath, $true) } finally { $fs.Dispose() }
+        return
+    }
+    Copy-Item -LiteralPath $src -Destination $dstPath -Force
+}
+function Remove-TargetFile($t, [string]$path) {
+    if ($t.Kind -eq 'Sftp') { (Connect-SftpTarget $t).DeleteFile($path); return }
+    Remove-Item -LiteralPath $path -Force
+}
+function Move-TargetFile($t, [string]$from, [string]$to) {
+    if ($t.Kind -eq 'Sftp') { (Connect-SftpTarget $t).RenameFile($from, $to); return }
+    [System.IO.File]::Move($from, $to)
+}
+# 目标端原地复制一份（覆盖前备份用）。SFTP 协议本身没有"服务端复制"，
+# 优先借服务器的 cp（零流量），没有命令通道才退回"下载再上传"。
+function Copy-TargetFileInPlace($t, [string]$from, [string]$to) {
+    if ($t.Kind -eq 'Local') { Copy-Item -LiteralPath $from -Destination $to -Force; return }
+    $s = Get-SshExecSession $t
+    if ($s) {
+        try {
+            $r = $s.RunCommand('cp -- ' + (Quote-ShArg $from) + ' ' + (Quote-ShArg $to))
+            if ($r.ExitStatus -eq 0) { return }
+        } catch { }
+    }
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        $c = Connect-SftpTarget $t
+        $c.DownloadFile($from, $ms)
+        $ms.Position = 0
+        $c.UploadFile($ms, $to, $true)
+    } finally { $ms.Dispose() }
+}
+# 目标端某个文件的 MD5。本地直接算；远程走 md5sum，拿不到就返回 $null（上层退化为只比大小）。
+function Get-TargetFileMd5($t, [string]$path) {
+    if ($t.Kind -eq 'Local') { return (Get-FileHashMd5 $path) }
+    return (Get-RemoteMd5 $path)
+}
+
+# 「测试连接」：把能探到的信息一次性告诉用户，出错也给出人话原因
+function Test-TargetConnection($t) {
+    $lines = New-Object System.Collections.ArrayList
+    try {
+        if ($t.Kind -eq 'Local') {
+            if ([string]::IsNullOrWhiteSpace($t.Dir)) { throw '还没有填写服务端 mods 文件夹。' }
+            if (-not (Test-Path -LiteralPath $t.Dir)) { throw ("路径不存在：{0}" -f $t.Dir) }
+            $n = @(Get-ChildItem -LiteralPath $t.Dir -File -Filter '*.jar' -ErrorAction SilentlyContinue).Count
+            [void]$lines.Add('✅ 本地文件夹可用')
+            [void]$lines.Add(("   路径：{0}" -f $t.Dir))
+            [void]$lines.Add(("   现有 jar：{0} 个" -f $n))
+            return @{ Ok = $true; Text = ($lines -join "`r`n") }
+        }
+
+        Disconnect-SftpTarget
+        $c = Connect-SftpTarget $t
+        [void]$lines.Add('✅ SFTP 连接成功')
+        [void]$lines.Add(("   服务端：{0}" -f $c.ConnectionInfo.ServerVersion))
+        [void]$lines.Add(("   主机  ：{0}:{1}   用户：{2}" -f $t.Host, $t.Port, $t.User))
+
+        $showDir = $t.Dir
+        if ([string]::IsNullOrWhiteSpace($showDir)) {
+            $showDir = $c.WorkingDirectory
+            [void]$lines.Add('⚠ 还没填远程 mods 目录，下面列的是登录后的默认目录，找到 mods 后把它填进去：')
+        }
+        try { $list = @($c.ListDirectory($showDir) | Where-Object { $_.Name -notin @('.', '..') }) }
+        catch { throw ("能连上，但读不了目录 {0} —— {1}" -f $showDir, $_.Exception.Message) }
+
+        $jars = @($list | Where-Object { -not $_.IsDirectory -and $_.Name.ToLower().EndsWith('.jar') })
+        [void]$lines.Add(("   目录  ：{0}" -f $showDir))
+        [void]$lines.Add(("   内容  ：{0} 项，其中 jar {1} 个" -f $list.Count, $jars.Count))
+        if ($list.Count -gt 0) {
+            [void]$lines.Add('   前几项：')
+            foreach ($it in ($list | Select-Object -First 8)) {
+                [void]$lines.Add(("     {0} {1}" -f $(if ($it.IsDirectory) { '[目录]' } else { '      ' }), $it.Name))
+            }
+        }
+
+        $s = Get-SshExecSession $t
+        if ($s) {
+            $r = $s.RunCommand('command -v md5sum || echo NO_MD5SUM')
+            $hasMd5 = ([string]$r.Result) -notmatch 'NO_MD5SUM'
+            [void]$lines.Add($(if ($hasMd5) {
+                '✅ 服务器有 md5sum —— 内容比对不用把整个整合包下载下来'
+            } else {
+                '⚠ 服务器没有 md5sum —— 内容比对只能靠文件大小（退化为更快的模式）'
+            }))
+        } else {
+            [void]$lines.Add('⚠ 服务器不允许执行命令（只开了 SFTP）—— 内容比对只能靠文件大小')
+        }
+        return @{ Ok = $true; Text = ($lines -join "`r`n") }
+    } catch {
+        return @{ Ok = $false; Text = ('❌ ' + $_.Exception.Message) }
+    }
+}
+
 function Set-Busy([bool]$busy, [string]$text) {
     $btnScan.Enabled = -not $busy
     $btnRefresh.Enabled = -not $busy
@@ -1646,24 +2182,42 @@ function Get-ValidDir([string]$path, [string]$label) {
 
 function Invoke-Scan {
     $clientDir = $null
-    $serverDir = $null
+    $target = $null
     try {
         $clientDir = Get-ValidDir $txtClient.Text '客户端 mods'
-        $serverDir = Get-ValidDir $txtServer.Text '服务端 mods'
+        $target = Get-CurTarget
+        if ($target.Kind -eq 'Local') {
+            $target.Dir = Get-ValidDir $txtServer.Text '服务端 mods'
+        } else {
+            # SFTP：连接和目录先验通，别扫到一半才炸
+            if ([string]::IsNullOrWhiteSpace($target.Host)) {
+                throw "还没有配置 SFTP 服务器。`n`n点「SFTP 设置...」填上主机、端口、用户名、密码。"
+            }
+            if ([string]::IsNullOrWhiteSpace($target.Dir)) {
+                throw "还没有填写远程 mods 目录（例如 /mods）。`n`n就是面板文件管理器里那个 mods 文件夹的路径。"
+            }
+            if (-not (Initialize-SshNet)) { throw $script:SshNetError }
+            $null = Connect-SftpTarget $target
+            try { $null = (Connect-SftpTarget $target).ListDirectory($target.Dir) }
+            catch { throw ("连上了服务器，但读不了远程目录 {0}：`n{1}" -f $target.Dir, $_.Exception.Message) }
+        }
     } catch {
         # 未成功扫描：记下原因。退出日志靠它区分「没扫成」和「扫了但没变更」——
         # 路径失效时如果只写"客户端 0 个 mod"，看起来像是"没事可做"，排查时会走弯路。
         $script:LastScanOk = $false
-        $script:LastScanMsg = '路径无效，未执行扫描：' + ($_.Exception.Message -replace '\s+', ' ')
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '路径有误',
+        $script:LastScanMsg = '目标端不可用，未执行扫描：' + ($_.Exception.Message -replace '\s+', ' ')
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '目标端不可用',
             [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-        Set-Busy $false '未扫描：路径有误'
+        Set-Busy $false '未扫描：目标端不可用'
         return
     }
 
+    $serverDir = $target.Dir
+    $script:ActiveTarget = $target
+
     # 归一化后回填，避免 "C:\a\" 与 "C:\a" 被视为不同
     $txtClient.Text = Get-DisplayPath $clientDir
-    $txtServer.Text = Get-DisplayPath $serverDir
+    if ($target.Kind -eq 'Local') { $txtServer.Text = Get-DisplayPath $serverDir }
 
     # 重入保护：扫描期间 DoEvents 会泵消息，可能让文件监控/按钮再次触发扫描，
     # 形成嵌套扫描把界面拖死。这里直接挡掉。
@@ -1675,8 +2229,8 @@ function Invoke-Scan {
     $script:CancelScan = $false
     $script:HashCache = @{}
     $scanSw = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Log ('扫描开始 | 客户端={0} | 服务端={1} | 哈希校验={2} | 哈希实现={3}' -f
-        $clientDir, $serverDir, $chkHash.Checked, $script:HashImpl)
+    Write-Log ('扫描开始 | 客户端={0} | 目标={1} | 哈希校验={2} | 哈希实现={3}' -f
+        $clientDir, (Get-TargetLabel $target), $chkHash.Checked, $script:HashImpl)
 
     Set-Busy $true '正在读取文件列表...'
     $useHash = $chkHash.Checked
@@ -1684,10 +2238,9 @@ function Invoke-Scan {
     try {
         $srcFiles = @(Get-ChildItem -LiteralPath $clientDir -File -Filter '*.jar' -ErrorAction SilentlyContinue |
                       Sort-Object Name)
-        $dstFiles = @(Get-ChildItem -LiteralPath $serverDir -File -Filter '*.jar' -ErrorAction SilentlyContinue |
-                      Sort-Object Name)
+        $dstFiles = @(Get-TargetJarFiles $target)
         $tEnum = $scanSw.ElapsedMilliseconds
-        Write-Log ("枚举完成：客户端 {0} 个 / 服务端 {1} 个，耗时 {2} ms" -f $srcFiles.Count, $dstFiles.Count, $tEnum)
+        Write-Log ("枚举完成：客户端 {0} 个 / 目标端 {1} 个，耗时 {2} ms" -f $srcFiles.Count, $dstFiles.Count, $tEnum)
 
         # --- 服务端文件索引：按 base 名 和 mod key 双向挂载 ---
         $idxByBase = @{}
@@ -1774,7 +2327,7 @@ function Invoke-Scan {
                 }
                 $hash = Get-FileHashMd5 $f.FullName
                 if ($hash -and $sameBase) {
-                    if ($null -eq $sameBase.Hash) { $sameBase.Hash = Get-FileHashMd5 $sameBase.Full }
+                    if ($null -eq $sameBase.Hash) { $sameBase.Hash = Get-TargetFileMd5 $target $sameBase.Full }
                     if ($sameBase.Hash -and $sameBase.Hash -eq $hash) {
                         $state = '已同步'
                         $action = '内容一致，无需操作'
@@ -1838,7 +2391,7 @@ function Invoke-Scan {
 
                     $hits = New-Object System.Collections.ArrayList
                     foreach ($d in $pool) {
-                        if ($null -eq $d.Hash) { $d.Hash = Get-FileHashMd5 $d.Full }
+                        if ($null -eq $d.Hash) { $d.Hash = Get-TargetFileMd5 $target $d.Full }
                         if ($d.Hash -and $d.Hash -eq $srcHash) { [void]$hits.Add($d) }
                     }
                     if ($hits.Count -eq 0) { continue }
@@ -1982,7 +2535,7 @@ function Get-SyncPlan {
                 [void]$skipped.Add(@{ Rec = $r; Why = '缺少重命名来源信息，请重新扫描' })
                 continue
             }
-            if (-not (Test-Path -LiteralPath $from.Full)) {
+            if (-not (Test-TargetFile $script:ActiveTarget $from.Full)) {
                 [void]$skipped.Add(@{ Rec = $r; Why = "服务端原文件已不存在：$($from.Name)" })
                 continue
             }
@@ -2044,7 +2597,11 @@ function Invoke-Sync {
         return
     }
 
-    $serverDir = Resolve-InputPath $txtServer.Text
+    # 同步一律以「当前生效目标」为准。注意不要在这里重新读 $txtServer：
+    # SFTP 模式下那个文本框装的是远程目录，而 ActiveTarget 里的本地路径是校验过、归一化过的。
+    $target = Get-ActiveTarget
+    $script:ActiveTarget = $target
+    $serverDir = $target.Dir
 
     # ---------- 安全提示：同步前明细 ----------
     $overwrite = @()
@@ -2086,7 +2643,7 @@ function Invoke-Sync {
         foreach ($s in $plan.Skipped) { [void]$items.Add("! $($s.Rec.FileName) —— $($s.Why)") }
     }
 
-    $noteText = "目标文件夹：$serverDir"
+    $noteText = "目标端：$(Get-TargetLabel $target)"
     if ($chkBackup.Checked) { $noteText += "`n选项：覆盖前会把服务端原文件备份为 原名.bak" }
     $noteText += "`n建议先关闭服务端，避免 jar 被占用。"
 
@@ -2124,19 +2681,19 @@ function Invoke-Sync {
         $progress.Value = [Math]::Min($step, $progress.Maximum)
         [System.Windows.Forms.Application]::DoEvents()
 
-        $target = Join-Path $serverDir $r.FileName
+        $dstPath = Join-RemotePath $serverDir $r.FileName
+        if ($target.Kind -eq 'Local') { $dstPath = Join-Path $serverDir $r.FileName }
         $renamed = $false
         try {
-            if (Test-Path -LiteralPath $target) { throw "服务端已存在同名文件：$($r.FileName)" }
+            if (Test-TargetFile $target $dstPath) { throw "服务端已存在同名文件：$($r.FileName)" }
             if ($chkBackup.Checked) {
                 $bak = "$($from.Full).bak"
-                if (Test-Path -LiteralPath $bak) { $bak = "$($from.Full)." + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak' }
-                Copy-Item -LiteralPath $from.Full -Destination $bak -Force
+                if (Test-TargetFile $target $bak) { $bak = "$($from.Full)." + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak' }
+                Copy-TargetFileInPlace $target $from.Full $bak
             }
-            # 与其它改名路径保持一致：字面路径 + 目标存在就报错（上面已判过）。
-            # 不用 Move-Item -Destination -Force —— 那个参数的语义是"目标存在就覆盖"，
-            # 改名路径绝不允许覆盖内容，用 File.Move 把这条约束钉死。
-            [System.IO.File]::Move($from.Full, $target)
+            # 改名只走 Move-TargetFile（本地是 File.Move，远程是 SFTP RenameFile）：
+            # 目标存在就报错，绝不允许在改名路径上覆盖内容。
+            Move-TargetFile $target $from.Full $dstPath
             $r.Result = "已重命名：$($from.Name) → $($r.FileName)"
             $renCount++
             $renamed = $true
@@ -2161,18 +2718,19 @@ function Invoke-Sync {
         $progress.Value = [Math]::Min($step, $progress.Maximum)
         [System.Windows.Forms.Application]::DoEvents()
 
-        $target = Join-Path $serverDir $r.FileName
+        $dstPath = Join-RemotePath $serverDir $r.FileName
+        if ($target.Kind -eq 'Local') { $dstPath = Join-Path $serverDir $r.FileName }
         $note = ''
         try {
-            if ((Test-Path -LiteralPath $target) -and $chkBackup.Checked) {
-                $bak = "$target.bak"
-                if (Test-Path -LiteralPath $bak) {
-                    $bak = "$target." + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak'
+            if ((Test-TargetFile $target $dstPath) -and $chkBackup.Checked) {
+                $bak = "$dstPath.bak"
+                if (Test-TargetFile $target $bak) {
+                    $bak = "$dstPath." + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak'
                 }
-                Copy-Item -LiteralPath $target -Destination $bak -Force
+                Copy-TargetFileInPlace $target $dstPath $bak
                 $note = ' (已备份 .bak)'
             }
-            Copy-Item -LiteralPath $r.SrcPath -Destination $target -Force
+            Copy-LocalFileToTarget $target $r.SrcPath $dstPath
             $r.Result = '成功' + $note
             $okCount++
             $copiedSrc[[string]$r.SrcPath] = $true
@@ -2200,8 +2758,8 @@ function Invoke-Sync {
         }
 
         try {
-            if (Test-Path -LiteralPath $d.Old.Full) {
-                Remove-Item -LiteralPath $d.Old.Full -Force
+            if (Test-TargetFile $target $d.Old.Full) {
+                Remove-TargetFile $target $d.Old.Full
                 [void]$script:SyncLog.Add("DEL   $($d.Old.Name)")
             }
         } catch {
@@ -2291,8 +2849,10 @@ function Invoke-AutoRename {
     $targets = @($script:Records | Where-Object { $_.StatusKind -eq '重命名' })
     if ($targets.Count -eq 0) { return }
 
-    $serverDir = Resolve-InputPath $txtServer.Text
-    if ([string]::IsNullOrWhiteSpace($serverDir) -or -not (Test-Path -LiteralPath $serverDir)) { return }
+    $tgt = Get-ActiveTarget
+    if ([string]::IsNullOrWhiteSpace($tgt.Dir)) { return }
+    if ($tgt.Kind -eq 'Local' -and -not (Test-Path -LiteralPath $tgt.Dir)) { return }
+    $serverDir = $tgt.Dir
 
     $script:AutoRenameBusy = $true
     $done = 0
@@ -2303,11 +2863,12 @@ function Invoke-AutoRename {
             $from = $r.DstRenameFrom
             if (-not $from) { continue }
             $fromName = [string]$from.Name
-            $target = Join-Path $serverDir $r.FileName
+            $dstPath = Join-RemotePath $serverDir $r.FileName
+            if ($tgt.Kind -eq 'Local') { $dstPath = Join-Path $serverDir $r.FileName }
             try {
-                if (-not (Test-Path -LiteralPath $from.Full)) { continue }
-                if (Test-Path -LiteralPath $target) { throw "服务端已存在同名文件：$($r.FileName)" }
-                [System.IO.File]::Move($from.Full, $target)
+                if (-not (Test-TargetFile $tgt $from.Full)) { continue }
+                if (Test-TargetFile $tgt $dstPath) { throw "服务端已存在同名文件：$($r.FileName)" }
+                Move-TargetFile $tgt $from.Full $dstPath
                 $done++
                 Write-Log ("自动重命名：{0} -> {1}" -f $fromName, $r.FileName)
                 # 记账紧跟其后但独立捕获：文件已经改名成功，记账再出错也不能算"改名失败"，
@@ -2386,7 +2947,8 @@ function Rename-Record($r) {
     }
 
     # 服务端要一起改名的那个文件：优先同名，其次内容完全一致的那个
-    $serverDir = Resolve-InputPath $txtServer.Text
+    $tgt = Get-ActiveTarget
+    $serverDir = $tgt.Dir
     $serverOld = Get-ServerCounterpartForRecord $r $serverDir
 
     $items = New-Object System.Collections.ArrayList
@@ -2412,9 +2974,10 @@ function Rename-Record($r) {
 
     if ($doneClient -and $serverOld) {
         try {
-            $serverNew = Join-Path $serverDir $newName
-            if (Test-Path -LiteralPath $serverNew) { throw "服务端已存在同名文件：$newName" }
-            [System.IO.File]::Move($serverOld.FullName, $serverNew)
+            $serverNew = Join-RemotePath $serverDir $newName
+            if ($tgt.Kind -eq 'Local') { $serverNew = Join-Path $serverDir $newName }
+            if (Test-TargetFile $tgt $serverNew) { throw "服务端已存在同名文件：$newName" }
+            Move-TargetFile $tgt $serverOld.FullName $serverNew
             $doneServer = $true
         } catch { if (-not $err) { $err = "服务端改名失败：$($_.Exception.Message)" } }
     }
@@ -2537,7 +3100,9 @@ function Show-PrefixDialog([int]$count, [object[]]$samples) {
 
 # 算出批量改名方案（纯逻辑，不碰界面，便于单测）
 # 返回 @{ Plan = @(每项: Rec/NewName/ClientNew/ServerOld/ServerNew); Skipped = @(Rec/Why) }
-function Build-RenamePlan([object[]]$records, [string]$prefix, [string]$clientDir, [string]$serverDir, [bool]$alsoServer) {
+function Build-RenamePlan([object[]]$records, [string]$prefix, [string]$clientDir, [string]$serverDir, [bool]$alsoServer, $tgt = $null) {
+    # $tgt 不给就是纯本地（测试和旧调用都走这条），给了才按目标端类型分派
+    if (-not $tgt) { $tgt = [pscustomobject]@{ Kind = 'Local'; Dir = $serverDir } }
     $plan = New-Object System.Collections.ArrayList
     $skipped = New-Object System.Collections.ArrayList
     foreach ($r in @($records)) {
@@ -2561,8 +3126,9 @@ function Build-RenamePlan([object[]]$records, [string]$prefix, [string]$clientDi
         if ($alsoServer) {
             $srvOld = Get-ServerCounterpartForRecord $r $serverDir
             if ($srvOld) {
-                $srvNew = Join-Path $serverDir $newName
-                if (Test-Path -LiteralPath $srvNew) {
+                $srvNew = Join-RemotePath $serverDir $newName
+                if ($tgt.Kind -eq 'Local') { $srvNew = Join-Path $serverDir $newName }
+                if (Test-TargetFile $tgt $srvNew) {
                     [void]$skipped.Add(@{ Rec = $r; Why = "服务端已存在同名文件：$newName" })
                     continue
                 }
@@ -2576,7 +3142,8 @@ function Build-RenamePlan([object[]]$records, [string]$prefix, [string]$clientDi
 }
 
 # 执行改名方案（同样是纯逻辑）。客户端先全部改完，再动服务端。
-function Invoke-RenamePlan([object[]]$plan) {
+function Invoke-RenamePlan([object[]]$plan, $tgt = $null) {
+    if (-not $tgt) { $tgt = [pscustomobject]@{ Kind = 'Local'; Dir = '' } }
     $details = New-Object System.Collections.ArrayList
     $res = @{ ClientOk = 0; ServerOk = 0; Fail = 0; FirstError = ''; Details = $details }
     foreach ($p in @($plan)) {
@@ -2597,7 +3164,7 @@ function Invoke-RenamePlan([object[]]$plan) {
     foreach ($p in @($plan)) {
         if (-not $p.ServerOld) { continue }
         try {
-            [System.IO.File]::Move($p.ServerOld.FullName, $p.ServerNew)
+            Move-TargetFile $tgt $p.ServerOld.FullName $p.ServerNew
             $res.ServerOk++
             [void]$details.Add("OK    [服务端] $($p.ServerOld.Name) -> $($p.NewName)")
         } catch {
@@ -2630,8 +3197,9 @@ function Rename-Batch([object[]]$records) {
     }
 
     $clientDir = Split-Path -Parent $targets[0].SrcPath
-    $serverDir = Resolve-InputPath $txtServer.Text
-    $built = Build-RenamePlan $targets $prefix $clientDir $serverDir ([bool]$ask.AlsoServer)
+    $tgt = Get-ActiveTarget
+    $serverDir = $tgt.Dir
+    $built = Build-RenamePlan $targets $prefix $clientDir $serverDir ([bool]$ask.AlsoServer) $tgt
     $plan = @($built.Plan)
     $skipped = @($built.Skipped)
 
@@ -2667,7 +3235,7 @@ function Rename-Batch([object[]]$records) {
     if (-not $ok) { return }
 
     Set-Busy $true '正在批量重命名...'
-    $res = Invoke-RenamePlan $plan
+    $res = Invoke-RenamePlan $plan $tgt
     Set-Busy $false
 
     foreach ($d in @($res.Details)) { Write-Log ('批量重命名 ' + $d) }
@@ -3104,16 +3672,24 @@ function Open-FileLocation([string]$path) {
 # 找出某条记录在服务端对应的那个文件（改名用）：
 # 先看服务端有没有同名文件；没有就按"大小相同 + MD5 相同"认内容一致的那个。
 # 返回 FileInfo；找不到返回 $null。
-function Get-ServerCounterpartForRecord($r, [string]$serverDir) {
+function Get-ServerCounterpartForRecord($r, [string]$serverDir, $tgt = $null) {
     if (-not $r) { return $null }
-    if ([string]::IsNullOrWhiteSpace($serverDir) -or -not (Test-Path -LiteralPath $serverDir)) { return $null }
-    $samePath = Join-Path $serverDir $r.FileName
-    if (Test-Path -LiteralPath $samePath) { return (Get-Item -LiteralPath $samePath) }
+    if (-not $tgt) { $tgt = Get-ActiveTarget }
+    if ([string]::IsNullOrWhiteSpace($serverDir)) { return $null }
+    if ($tgt.Kind -eq 'Local' -and -not (Test-Path -LiteralPath $serverDir)) { return $null }
+
+    # 统一返回 @{Name; FullName}，本地/远程调用方一视同仁
+    $samePath = Join-RemotePath $serverDir $r.FileName
+    if ($tgt.Kind -eq 'Local') { $samePath = Join-Path $serverDir $r.FileName }
+    if (Test-TargetFile $tgt $samePath) { return [pscustomobject]@{ Name = $r.FileName; FullName = $samePath } }
+
     $srcHash = Get-FileHashMd5 $r.SrcPath
     if (-not $srcHash) { return $null }
-    foreach ($f in @(Get-ChildItem -LiteralPath $serverDir -File -Filter '*.jar' -ErrorAction SilentlyContinue)) {
+    foreach ($f in @(Get-TargetJarFiles $tgt)) {
         if ([long]$f.Length -ne [long]$r.Size) { continue }
-        if ((Get-FileHashMd5 $f.FullName) -eq $srcHash) { return $f }
+        if ((Get-TargetFileMd5 $tgt $f.FullName) -eq $srcHash) {
+            return [pscustomobject]@{ Name = $f.Name; FullName = $f.FullName }
+        }
     }
     return $null
 }
@@ -3123,8 +3699,8 @@ function Get-ServerFileForRecord($r) {
     if (-not $r) { return '' }
     if ($r.DstSameBase -and $r.DstSameBase.Full) { return [string]$r.DstSameBase.Full }
     if ($r.DstRenameFrom -and $r.DstRenameFrom.Full) { return [string]$r.DstRenameFrom.Full }
-    $srvDir = Resolve-InputPath $txtServer.Text
-    $f = Get-ServerCounterpartForRecord $r $srvDir
+    $tgt = Get-ActiveTarget
+    $f = Get-ServerCounterpartForRecord $r $tgt.Dir $tgt
     if ($f) { return [string]$f.FullName }
     return ''
 }
@@ -3253,7 +3829,43 @@ $btnClient.Add_Click({
     }
 })
 
+# 切换目标类型：立刻保存 + 更新界面 + 断开旧连接
+$cboTargetKind.Add_SelectedIndexChanged({
+    if ($script:IgnoreTargetEvent) { return }
+    Set-CurProfileField 'TargetKind' $(if ($cboTargetKind.SelectedIndex -eq 1) { 'Sftp' } else { 'Local' })
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        # 切到 SFTP 时，把本地路径先收起来，框里换成远程目录
+        Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+        $txtServer.Text = [string](Get-CurProfile).SftpDir
+    } else {
+        Set-CurProfileField 'SftpDir' (Normalize-RemoteDir $txtServer.Text)
+        $txtServer.Text = $(if ((Get-CurProfile).ServerDir) { Get-DisplayPath (Get-CurProfile).ServerDir } else { '' })
+    }
+    Write-Cfg
+    Update-TargetUI
+    $script:ActiveTarget = $null
+    Disconnect-SftpTarget
+    $lblStatus.Text = '同步目标已切换，按 F5 重新扫描'
+})
+
 $btnServer.Add_Click({
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        # SFTP 模式：弹出连接设置；顺便把对话框里的远程目录回填到主界面
+        $r = Show-SftpDialog
+        if ($r) {
+            Set-CurProfileField 'SftpHost' $r.Host
+            Set-CurProfileField 'SftpPort' $r.Port
+            Set-CurProfileField 'SftpUser' $r.User
+            Set-CurProfileField 'SftpPass' $r.Pass
+            Set-CurProfileField 'SftpDir'  $r.Dir
+            $txtServer.Text = $r.Dir
+            Write-Cfg
+            Disconnect-SftpTarget
+            $script:ActiveTarget = $null
+            $lblStatus.Text = "SFTP 设置已保存：$($r.User)@$($r.Host):$($r.Port)$($r.Dir)（按 F5 扫描）"
+        }
+        return
+    }
     $p = Select-Folder '选择【服务端】的 mods 文件夹' (Resolve-InputPath $txtServer.Text)
     if ($p) {
         $txtServer.Text = Get-DisplayPath $p
@@ -3269,7 +3881,11 @@ $txtClient.Add_Leave({
 })
 
 $txtServer.Add_Leave({
-    Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+    if ($cboTargetKind.SelectedIndex -eq 1) {
+        Set-CurProfileField 'SftpDir' (Normalize-RemoteDir $txtServer.Text)
+    } else {
+        Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+    }
     Write-Cfg
 })
 
@@ -3392,11 +4008,11 @@ $form.Add_Shown({
 
     # 先扫描，扫描完成后再挂文件监控（延迟挂载是修复"启动即卡死"的关键之一：
     # 首次扫描时 DoEvents 会泵消息，此时若监控已就绪，事件重入会把界面拖死）
-    if ($txtClient.Text -and $txtServer.Text) {
+    if ($txtClient.Text -and (Test-TargetConfigured)) {
         Invoke-Scan
     } else {
-        $script:LastScanMsg = '未填写客户端/服务端路径，未执行扫描'
-        $lblStatus.Text = '请先选择客户端与服务端的 mods 文件夹（选择后会自动保存）'
+        $script:LastScanMsg = '未填写客户端路径或同步目标，未执行扫描'
+        $lblStatus.Text = '请先选择客户端 mods 文件夹和同步目标（选择后会自动保存）'
     }
 
     $script:PendingWatchStart = $true
@@ -3408,23 +4024,24 @@ $form.Add_FormClosing({
     try {
         if (-not $script:LastScanOk) {
             # 没扫成 ≠ 扫了没变更：这两种情况在日志里必须一眼能分开
-            Write-Log ('退出：本次会话未成功扫描（{0}）| 客户端={1} | 服务端={2}' -f `
-                $script:LastScanMsg, (Get-CurClientDir), (Get-CurServerDir))
+            Write-Log ('退出：本次会话未成功扫描（{0}）| 客户端={1} | 目标={2}' -f `
+                $script:LastScanMsg, (Get-CurClientDir), (Get-TargetLabel (Get-CurTarget)))
         } else {
             $pending = @($script:Records | Where-Object { $_.Checked -and $_.StatusKind -ne '已同步' }).Count
-            Write-Log ('退出：配置档「{0}」客户端 {1} 个 mod，待同步变更 {2} 个 | 客户端={3} | 服务端={4}' -f `
-                (Get-CurProfile).Name, $script:Records.Count, $pending, (Get-CurClientDir), (Get-CurServerDir))
+            Write-Log ('退出：配置档「{0}」客户端 {1} 个 mod，待同步变更 {2} 个 | 客户端={3} | 目标={4}' -f `
+                (Get-CurProfile).Name, $script:Records.Count, $pending, (Get-CurClientDir), (Get-TargetLabel (Get-CurTarget)))
         }
     } catch { }
 
     try {
         Set-CurProfileField 'ClientDir' (Resolve-InputPath $txtClient.Text)
-        Set-CurProfileField 'ServerDir' (Resolve-InputPath $txtServer.Text)
+        Save-TargetFromUI
         Write-Cfg
     } catch { }
 
     try { $watchTimer.Stop() } catch { }
     try { if ($script:Watcher) { $script:Watcher.Dispose() } } catch { }
+    Disconnect-SftpTarget
 })
 
 Write-Log ('在线链接功能：CurseForge 指纹实现={0}' -f $(if ($script:CfHashReady) { '可用' } else { '不可用' }))

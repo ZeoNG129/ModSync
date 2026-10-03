@@ -21,7 +21,7 @@
    · Get-BytesText / Resolve-InputPath / Get-DisplayPath —— 显示与路径归一化
 
  不覆盖：Invoke-Scan / Invoke-Sync 的界面流程（依赖 WinForms 控件），
-   那部分靠"运行源码做一次真实比对与同步"验收，见 README「三、判定依据」。
+   那部分靠"运行源码做一次真实比对与同步"验收，见 README「八、判定依据」。
 ================================================================================
 #>
 
@@ -83,7 +83,12 @@ $wanted = @(
     'Get-ModIdentity', 'Get-BytesText', 'Resolve-InputPath', 'Get-DisplayPath',
     'Get-NormName', 'Test-NameMatch',
     'Build-RenamePlan', 'Invoke-RenamePlan', 'Test-CanDeleteOldVersion',
-    'Get-ServerCounterpartForRecord'
+    'Get-ServerCounterpartForRecord',
+    # 同步目标抽象层（只测本地分支）—— 远程分支要真连服务器，不放进单元测试
+    'Normalize-RemoteDir', 'Join-RemotePath', 'ConvertTo-PortOrDefault',
+    'Test-TargetFile', 'Get-TargetFileSize', 'Get-TargetFileMd5',
+    'Get-TargetJarFiles', 'Move-TargetFile', 'Remove-TargetFile',
+    'Copy-LocalFileToTarget', 'Copy-TargetFileInPlace'
 )
 $found = @{}
 $allFuncs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
@@ -97,12 +102,14 @@ foreach ($w in $wanted) {
 }
 Write-Host ("已抽取 {0} 个纯函数（不执行脚本主体、不创建窗口）" -f $found.Count)
 
-# 依赖替身：这些函数会碰配置文件/磁盘哈希，测试里用不着真货
+# 依赖替身：这些函数会碰配置文件/磁盘哈希/远程连接，测试里用不着真货
 $script:IgnoredMoves = New-Object System.Collections.ArrayList
 function Move-IgnoredIdentity([string]$oldKey, [string]$oldName, [string]$newKey, [string]$newName) {
     [void]$script:IgnoredMoves.Add("$oldKey -> $newKey")
 }
 function Get-FileHashMd5([string]$path) { return $null }
+# 单元测试里一律当"本地目标"处理；远程分支不在测试范围内
+function Get-ActiveTarget { return [pscustomobject]@{ Kind = 'Local'; Dir = $script:TestSrvDir } }
 
 # ------------------------------------------------------------------ 临时目录
 $tmpRoot = 'D:\cache\ModSync'
@@ -112,6 +119,7 @@ $cliDir = Join-Path $work 'client'
 $srvDir = Join-Path $work 'server'
 [void](New-Item -ItemType Directory -Path $cliDir -Force)
 [void](New-Item -ItemType Directory -Path $srvDir -Force)
+$script:TestSrvDir = $srvDir   # 给 Get-ActiveTarget 替身用
 Write-Host "临时工作目录：$work"
 
 try {
@@ -290,6 +298,62 @@ try {
         Assert-Eq 1 $res.ClientOk '成功数'
         Assert-Eq 1 $res.Fail '失败数'
         Assert-True (Test-Path -LiteralPath (Join-Path $cliDir '[X]modG-1.0.jar')) '失败项不应影响后续项'
+    }
+
+    # ============================================================== 同步目标抽象层
+    Write-Host ''
+    Write-Host '同步目标抽象层 —— 远程路径归一化与本地分支分派' -ForegroundColor Cyan
+
+    Test-Case '远程目录归一化：反斜杠转正斜杠、补前导斜杠、去尾斜杠' {
+        Assert-Eq '/mods'        (Normalize-RemoteDir 'mods') '不带前导斜杠'
+        Assert-Eq '/mods'        (Normalize-RemoteDir '/mods/') '去掉尾部斜杠'
+        Assert-Eq '/mods'        (Normalize-RemoteDir '\mods\') '反斜杠'
+        Assert-Eq '/home/container/mods' (Normalize-RemoteDir '/home/container/mods/') '多级'
+        Assert-Eq '/'            (Normalize-RemoteDir '/') '根目录保持一个斜杠'
+        Assert-Eq ''             (Normalize-RemoteDir '') '空串'
+    }
+
+    Test-Case '远程路径拼接：根目录与普通目录都对' {
+        Assert-Eq '/mods/foo.jar'            (Join-RemotePath '/mods' 'foo.jar') '普通目录'
+        Assert-Eq '/foo.jar'                 (Join-RemotePath '/' 'foo.jar') '根目录'
+        Assert-Eq '/mods/foo.jar'            (Join-RemotePath '/mods/' 'foo.jar') '尾部多余斜杠'
+    }
+
+    Test-Case '端口解析：非法输入退回默认 22，合法值原样保留' {
+        Assert-Eq 22    (ConvertTo-PortOrDefault '22') '正常'
+        Assert-Eq 2022  (ConvertTo-PortOrDefault '2022') '翼龙常用端口'
+        Assert-Eq 22    (ConvertTo-PortOrDefault '') '空'
+        Assert-Eq 22    (ConvertTo-PortOrDefault 'abc') '非数字'
+        Assert-Eq 22    (ConvertTo-PortOrDefault '70000') '超范围'
+        Assert-Eq 22    (ConvertTo-PortOrDefault '0') '零'
+    }
+
+    Test-Case '目标端操作按 Kind 分派：Local 走本地文件系统' {
+        $t = [pscustomobject]@{ Kind = 'Local'; Dir = $srvDir }
+        $f = Join-Path $srvDir 'dispatch.jar'
+        [System.IO.File]::WriteAllText($f, 'DISPATCH')
+        Assert-True  (Test-TargetFile $t $f) '存在判定'
+        Assert-Eq 8  (Get-TargetFileSize $t $f) '大小'
+        $f2 = Join-Path $srvDir 'dispatch2.jar'
+        Move-TargetFile $t $f $f2
+        Assert-False (Test-TargetFile $t $f) '改名后旧名不存在'
+        Assert-True  (Test-TargetFile $t $f2) '改名后新名存在'
+        Copy-LocalFileToTarget $t $f2 (Join-Path $srvDir 'copy.jar')
+        Assert-Eq 'DISPATCH' ([System.IO.File]::ReadAllText((Join-Path $srvDir 'copy.jar'))) '复制内容一致'
+        Remove-TargetFile $t $f2
+        Assert-False (Test-TargetFile $t $f2) '删除生效'
+    }
+
+    Test-Case 'Get-TargetJarFiles 只认 .jar，且返回对象形状与 FileInfo 一致' {
+        $t = [pscustomobject]@{ Kind = 'Local'; Dir = $srvDir }
+        [System.IO.File]::WriteAllText((Join-Path $srvDir 'only-jar.jar'), 'x')
+        [System.IO.File]::WriteAllText((Join-Path $srvDir 'not-a-jar.txt'), 'x')
+        $list = @(Get-TargetJarFiles $t)
+        Assert-True (@($list | Where-Object { $_.Name -eq 'only-jar.jar' }).Count -eq 1) '应包含 jar'
+        Assert-True (@($list | Where-Object { $_.Name -eq 'not-a-jar.txt' }).Count -eq 0) '不应包含非 jar'
+        $one = $list | Where-Object { $_.Name -eq 'only-jar.jar' } | Select-Object -First 1
+        Assert-True ($null -ne $one.Length) '要有 Length 字段（上层判定依赖它）'
+        Assert-True ($null -ne $one.FullName) '要有 FullName 字段'
     }
 
     # ============================================================== 名字匹配

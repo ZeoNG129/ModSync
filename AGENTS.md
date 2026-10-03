@@ -12,21 +12,28 @@
 在 PCL2 更新完整合包后，自动找出客户端 mods 里新增/更新的 mod，勾选后一键同步到服务端
 （覆盖旧版本、清理残留旧 jar）。
 
-技术形态：**零依赖 PowerShell 5.1 + .NET WinForms 源码**，再用系统自带 `csc.exe`
+技术形态：**PowerShell 5.1 + .NET WinForms 源码**，再用系统自带 `csc.exe`
 把脚本压缩内嵌成单个绿色 exe（用户系统执行策略是 `Restricted`，禁用 .ps1，exe 不受管辖）。
+**唯一的第三方代码**是内嵌的 SSH.NET（MIT，见 `lib\README.md`），只为远程 SFTP 同步而带 ——
+用户侧依然是"一个 exe、双击就用、不用装东西"。
 
 核心能力之一：**重命名同步** —— 客户端 mod 改了名（或 PCL2 换了命名风格）时，
 按「内容一致 + 仅文件名不同」判定为 `重命名`，默认自动把服务端那个文件一起改名，
-保证双端文件名一致、不留下同一 mod 的两个 jar。见 README「二·六」。
+保证双端文件名一致、不留下同一 mod 的两个 jar。见 README「三」。
+
+核心能力之二：**远程同步（SFTP）** —— 同步目标可以是本地文件夹，也可以是简幻欢这类
+托管平台的 SFTP 服务器。所有目标端操作都收在 `Get-TargetJarFiles` / `Test-TargetFile` /
+`Copy-LocalFileToTarget` / `Remove-TargetFile` / `Move-TargetFile` / `Get-TargetFileMd5` 这一层里，
+上层（扫描/同步/改名）不关心对面是磁盘还是远程。见 README「七」。
 
 表格支持右键菜单（`Open-FileLocation`）：用 explorer `/select` 精确定位到 jar 本身，
-另有重命名、批量加前缀、详情、**复制 ▸**、**打开在线页面 ▸**、遗忘单个。见 README「二·七」。
+另有重命名、批量加前缀、详情、**复制 ▸**、**打开在线页面 ▸**、遗忘单个。见 README「四」。
 批量重命名 = 勾选 ≥2 个后统一加前缀（`A.jar` → `[客户端]A.jar`），核心逻辑在
 `Build-RenamePlan` / `Invoke-RenamePlan`（纯函数、可单测），界面流程在 `Rename-Batch`。
 
 右键「打开在线页面 ▸」可在浏览器里直达该 mod 的 **MC百科 / CurseForge / Modrinth** 页面，
 解析函数为 `Resolve-McmodLink` / `Resolve-CurseForgeLink` / `Resolve-ModrinthLink`
-＋ `Get-JarModMeta`（读 jar 元数据）＋ `Get-CfFingerprint`（CurseForge 文件指纹）。见 README「二·八」。
+＋ `Get-JarModMeta`（读 jar 元数据）＋ `Get-CfFingerprint`（CurseForge 文件指纹）。见 README「五」。
 
 项目在 `E:\MC\software\ModSync`（本文件就在项目根目录里，工作区是 `E:\MC\software` 还是
 `E:\MC\software\ModSync` 都会被读到）。**脚本内部一律从 `$PSScriptRoot` 推导自身位置，
@@ -35,10 +42,11 @@
 ```
 E:\MC\software\ModSync\
 ├─ ModSync.exe            日常运行入口（绿色单文件，**就放根目录**，双击即用；可单独拷走）
-├─ ModSync.ps1            主程序源码（3452 行，中文注释）—— 改功能只改这里
-├─ build-exe.ps1          打包器：ModSync.ps1 → 根目录的 ModSync.exe
+├─ ModSync.ps1            主程序源码（中文注释）—— 改功能只改这里
+├─ build-exe.ps1          打包器：ModSync.ps1 + lib\ → 根目录的 ModSync.exe
 ├─ icon.ico               图标源，打包时以 /win32icon + 嵌入资源两种方式打进 exe
 ├─ make-icon.ps1          PNG → 多尺寸 icon.ico（6 帧 PNG：256/128/64/48/32/16）
+├─ lib\Renci.SshNet.dll   内嵌的 SFTP 客户端库（SSH.NET 2023.0.0，MIT）—— 见 lib\README.md
 ├─ tests\Test-ModSync.ps1 纯逻辑单元测试（零依赖，AST 抽函数，不弹窗）
 ├─ README.md              使用文档、判定规则、故障排查
 ├─ AGENTS.md              本文件（给 AI Agent 的项目说明）
@@ -75,7 +83,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "E:\MC\software\ModSync\make
   覆盖 `Get-ModIdentity` / `Test-CanDeleteOldVersion` / `Build-RenamePlan` / `Invoke-RenamePlan` /
   `Test-NameMatch` 等，并顺带检查 `ModSync.ps1` 的 UTF-8 BOM 还在不在。全通过退出码 0。
   **界面流程（`Invoke-Scan` / `Invoke-Sync`）测不到**，仍需真实运行验收：改动判定逻辑时，
-  至少覆盖 README「三、判定依据」里的四级判定：
+  至少覆盖 README「八、判定依据」里的四级判定：
   ① 文件名剥版本 + 大小比对；② 同名同大小算 MD5；③ 同名不同版本归组删旧；
   ④ 内容一致仅文件名不同 → 重命名（必须两边 MD5 相等才成立）。
   改完可以照这个流程造现场自测：临时目录里放一对「内容相同、名字不同」的 jar，
@@ -95,8 +103,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "E:\MC\software\ModSync\make
    必须保持「解压 → 写临时 `.ps1` → `powershell -File`」的路线，`build-exe.ps1` 里有构建期自检。
 4. **兼容旧配置。** `Read-Cfg` 里保留了「旧版单档 ClientDir/ServerDir/Ignored* → 配置档 Profiles」
    的迁移逻辑和空列表规范化，改动配置结构时必须继续兼容，否则老用户升级后配置丢失。
-5. **运行环境基线**：Windows 7 SP1+ / .NET Framework 4.x / PowerShell 5.1（Win10、11 全自带），
-   不引入任何第三方模块、不加联网依赖。
+5. **运行环境基线**：Windows 7 SP1+ / .NET Framework 4.x / PowerShell 5.1（Win10、11 全自带）。
+   **不引入需要安装的第三方模块、不加运行时联网依赖。**
+   唯一的例外是内嵌的 SSH.NET（`lib\Renci.SshNet.dll`，MIT）—— 它随 exe 一起分发、
+   运行时解压到临时目录再 `Add-Type -Path`，用户不需要装任何东西。详见 `lib\README.md`，
+   里面记了"为什么非它不可"和"为什么锁死 2023.0.0 这个版本"。
+   再要加库的话，标准同样是：**能内嵌、用户零安装、许可证允许再分发**。
 6. **同步是破坏性操作**（覆盖 + 删除服务端旧 jar）。任何相关改动都必须保留
    「将新增 / 将覆盖 / 将删除」的明细确认弹窗和逐行结果回填，不允许静默删除。
    **而且删除必须等新版本先落地**：`Invoke-Sync` 里复制成功的记录才允许删它的旧版本，
@@ -143,6 +155,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "E:\MC\software\ModSync\make
 - 改完源码 → **跑测试** → 重打包 → 双击根目录的 `ModSync.exe` 验收；不要手工修改 `ModSync.exe`。
   改完务必确认 `ModSync.ps1` 的 UTF-8 BOM 还在（编辑器经常吃掉它），测试脚本会替你查。
 - 中文注释、中文界面文案保持现有风格；新增功能同步补进 `README.md`（含文件清单一节）。
-- 遇到 bug 修复后，在 README「七、故障排查」里以「（已修复）」小节记一条，写清现象与原因。
+- 遇到 bug 修复后，在 README「十二、故障排查」里以「（已修复）」小节记一条，写清现象与原因。
 - 文档里的**数字**（行数、exe 体积、构建输出）容易过期，改动后顺手核对一遍；
   拿不准就写"示意"而不是写死一个会过期的值。

@@ -1,0 +1,9 @@
+# 本项目的文件对"字节"敏感：.ps1 必须带 UTF-8 BOM（Windows PowerShell 5.1 的硬要求），
+# 又要能在 Windows 上双击运行。这里把规则写进仓库，别依赖每个人各自的 core.autocrlf。
+#
+# 注意：.gitattributes 管的是换行符，管不了 BOM ——
+# 提交前请跑一次 tests\Test-ModSync.ps1，它会检查 BOM 还在不在。
+*.ps1   text eol=crlf
+*.md    text eol=crlf
+*.ico   binary
+*.exe   binary

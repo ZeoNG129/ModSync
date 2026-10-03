@@ -274,7 +274,7 @@ journeymap-forge-1.20.1-5.9.18.jar
 
 ---
 
-## 五、同步行为与安全设计
+## 九、同步行为与安全设计
 
 点「同步到服务端」后，**先弹窗列出完整的变更明细**，确认后才动手：
 
@@ -309,7 +309,7 @@ journeymap-forge-1.20.1-5.9.18.jar
 
 ---
 
-## 九、常见问题
+## 十、常见问题
 
 **Q：扫描很慢，几百个 mod 要十几秒？**
 正常，主要耗时在读文件。可以：① 关掉「启用 MD5 精确校验」；
@@ -342,7 +342,7 @@ exe 是**把脚本打包进去**的独立文件，改脚本后必须重新运行
 
 ---
 
-## 七、故障排查
+## 十一、故障排查
 
 ### 「点开就卡死」（已修复）
 
@@ -608,7 +608,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -STA -File ".\ModSync.ps1"
 
 ---
 
-## 十、自动化测试（改判定逻辑后必跑）
+## 十二、自动化测试（改判定逻辑后必跑）
 
 判定和改名这类"错了就会动你文件"的逻辑，现在有一份零依赖的单元测试：
 
@@ -638,7 +638,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "tests\Test-ModSync.ps1"
 
 ---
 
-## 八、文件清单
+## 十三、文件清单
 
 | 文件 | 说明 |
 | --- | --- |
@@ -657,7 +657,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "tests\Test-ModSync.ps1"
 
 ---
 
-## 九、许可
+## 十四、许可
 
 本项目采用 **MIT License**，见 [LICENSE](LICENSE)。你可以自由使用、修改、再分发，
 包括商用；只需要保留版权声明和许可证原文。

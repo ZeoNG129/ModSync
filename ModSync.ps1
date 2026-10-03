@@ -109,6 +109,9 @@ function New-ProfileObject($p) {
         SftpUser    = $(if ($p) { [string]$p.SftpUser } else { '' })
         SftpPass    = $(if ($p) { [string]$p.SftpPass } else { '' })   # 只存本机 config.json，绝不进项目/日志/界面明文
         SftpDir     = $(if ($p) { [string]$p.SftpDir } else { '' })
+        # 上次探测发现"这台服务器不给命令通道（纯 SFTP chroot、没有 md5sum）"就记下来，
+        # 下次直接跳过探测 —— 省掉每次扫描开头那 10 秒的等待。
+        SftpNoExec  = [bool]$(if ($p -and $p.SftpNoExec) { $true } else { $false })
         IgnoredMods = $(if ($p) { @($p.IgnoredMods | Where-Object { $_ }) } else { @() })
         IgnoredInfo = $(if ($p) { @($p.IgnoredInfo | Where-Object { $_ }) } else { @() })
     }
@@ -172,14 +175,15 @@ function Write-Cfg {
         $json = $script:Config | ConvertTo-Json -Depth 8
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($script:ConfigFile, $json, $utf8)
-        return $true
     } catch {
         # 保存失败不能打断使用，但更不能静默：写日志 + 置标志，由定时器在状态栏提示一次。
         # 否则用户改了路径/配置档却什么都没保存，界面上一点提示都没有。
         $script:CfgSaveFailed = $true
         try { Write-Log ('配置保存失败（本次改动可能不会保留）：' + $_.Exception.Message) } catch { }
-        return $false
     }
+    # ⚠ 这里**故意不返回任何值**。PowerShell 会把函数体内所有没被接住的输出一起返回，
+    # 一旦 Write-Cfg 有返回值，任何"当语句调用它"的函数都会被污染返回值 ——
+    # 之前就是这样把 Get-SshExecSession 的返回值搞成了 @($true, <SshClient>) 数组。
 }
 
 function Read-Cfg {
@@ -500,10 +504,12 @@ function Test-TargetConfigured {
 }
 
 # 从当前配置档拼一个 SFTP 目标（对话框里改完字段后用它去测试连接）
-function New-SftpTargetFrom([string]$host, [string]$port, [string]$user, [string]$pass, [string]$dir) {
+# ⚠ 参数名不能叫 $host：PowerShell 变量名不区分大小写，$host 就是只读的内置变量 $Host，
+# 赋值会直接抛「无法覆盖变量 host，因为该变量为只读变量或常量」。
+function New-SftpTargetFrom([string]$sftpHost, [string]$port, [string]$user, [string]$pass, [string]$dir) {
     return [pscustomobject]@{
         Kind = 'Sftp'
-        Host = ([string]$host).Trim()
+        Host = ([string]$sftpHost).Trim()
         Port = (ConvertTo-PortOrDefault $port 22)
         User = ([string]$user).Trim()
         Pass = [string]$pass
@@ -1960,7 +1966,8 @@ function Connect-SftpTarget($t) {
     Disconnect-SftpTarget
     $c = New-Object Renci.SshNet.SftpClient($t.Host, [int]$t.Port, $t.User, $t.Pass)
     $c.ConnectionInfo.Timeout = [TimeSpan]::FromSeconds(20)
-    $c.OperationTimeout = [TimeSpan]::FromSeconds(180)
+    $c.OperationTimeout = [TimeSpan]::FromSeconds(180)   # 单个 SFTP 操作（上传/列目录）的上限
+    try { $c.KeepAliveInterval = [TimeSpan]::FromSeconds(30) } catch { }
     try { $c.Connect() } catch {
         try { $c.Dispose() } catch { }
         throw ("连不上 SFTP：{0}:{1} —— {2}" -f $t.Host, $t.Port, $_.Exception.Message)
@@ -1970,26 +1977,62 @@ function Connect-SftpTarget($t) {
 }
 
 # 独立的命令通道：用来在服务器上跑 md5sum / cp，省掉下载整个 jar 的流量。
-# 有些面板只给 SFTP 不给 shell，这里探测失败就返回 $null，上层自动退化为"只比大小"。
+# 有些面板只给 SFTP 不给 shell（简幻欢就是这种 chroot 环境），探测失败就返回 $null，
+# 上层自动退化为"只比大小"。
+#
+# ⚠ 这里必须显式设超时：SSH.NET 的 CommandTimeout 默认是 Timeout.InfiniteTimeSpan，
+# 服务器接受通道但永不返回时，RunCommand 会**永远挂住**，界面就彻底卡死。
+# 记住"这台服务器能不能跑命令"，并写回配置档 —— 下次扫描直接跳过探测，不用再白等 10 秒
+# ⚠ 这个函数**必须什么都不返回**：PowerShell 会把函数体内所有没被接住的输出一起返回，
+# 而 Write-Cfg 现在是有返回值的（成功 $true / 失败 $false）。
+# 早先漏了 [void]，结果 Get-SshExecSession 的返回值被污染成 @($true, <SshClient>) 数组，
+# 调用方拿到数组去调 CreateCommand 就报「[System.Boolean] 不包含名为 CreateCommand 的方法」。
+function Set-SftpExecCapability([bool]$ok) {
+    $script:SshExecOk = $ok
+    try {
+        $p = Get-CurProfile
+        if ($p -and [bool]$p.SftpNoExec -ne (-not $ok)) {
+            Set-CurProfileField 'SftpNoExec' (-not $ok)
+            Write-Cfg
+        }
+    } catch { }
+}
+
 function Get-SshExecSession($t) {
     if ($script:SshExecOk -eq $false) { return $null }
     if ($script:SshClient -and $script:SshClient.IsConnected) { return $script:SshClient }
     if (-not (Initialize-SshNet)) { return $null }
+    # 上次已确认这台服务器不给命令通道 → 本次会话直接跳过探测，别每次扫描都白等 10 秒。
+    # 想强制重新探测：点一次「测试连接」（它会重置探测状态）。
+    if ($null -eq $script:SshExecOk) {
+        $cp = Get-CurProfile
+        if ($cp -and $cp.SftpNoExec) {
+            $script:SshExecOk = $false
+            Write-Log '这台服务器上次探测为「不给命令通道」，本次跳过探测（内容比对按文件大小）'
+            return $null
+        }
+    }
     try {
         $s = New-Object Renci.SshNet.SshClient($t.Host, [int]$t.Port, $t.User, $t.Pass)
         $s.ConnectionInfo.Timeout = [TimeSpan]::FromSeconds(20)
+        # 注意：SSH.NET 2023.0.0 的 ConnectionInfo 上没有 CommandTimeout 属性，
+        # 超时只能逐条设在命令对象上（见 Invoke-RemoteCommand）；那个属性的默认值是
+        # Timeout.InfiniteTimeSpan —— 这正是"服务器不给 shell 就永远挂住"的根因。
+        try { $s.KeepAliveInterval = [TimeSpan]::FromSeconds(30) } catch { }
         $s.Connect()
-        $r = $s.RunCommand('echo MODSYNC_OK')
-        if ($r.ExitStatus -ne 0 -or ([string]$r.Result) -notmatch 'MODSYNC_OK') {
+        # 探测要短：服务器不给 shell 时，这一下最多等 10 秒就该放弃
+        $probe = Invoke-RemoteCommand $s 'echo MODSYNC_OK' 10
+        if (-not $probe.Ok -or $probe.Exit -ne 0 -or $probe.Out -notmatch 'MODSYNC_OK') {
             try { $s.Dispose() } catch { }
-            $script:SshExecOk = $false
+            [void](Set-SftpExecCapability $false)
+            Write-Log ('SSH 命令通道不可用（服务器只开了 SFTP）—— 内容比对退化为按文件大小。原因：' + $probe.Err)
             return $null
         }
         $script:SshClient = $s
-        $script:SshExecOk = $true
+        [void](Set-SftpExecCapability $true)
         return $s
     } catch {
-        $script:SshExecOk = $false
+        [void](Set-SftpExecCapability $false)
         Write-Log ('SSH 命令通道不可用（远程哈希/服务端备份会退化）：' + $_.Exception.Message)
         return $null
     }
@@ -2000,15 +2043,81 @@ function Quote-ShArg([string]$s) {
     return "'" + ($s -replace "'", "'\''") + "'"
 }
 
-function Get-RemoteMd5([string]$path) {
-    $s = Get-SshExecSession (Get-CurTarget)
-    if (-not $s) { return $null }
+# 跑一条远程命令，**带超时**。返回 @{ Ok; Exit; Out; Err }。
+# 为什么不用 SshClient.RunCommand：那个走的是连接级的 CommandTimeout，而它的默认值是
+# Timeout.InfiniteTimeSpan —— 服务器接受了通道却永不返回时会**永远挂住**，界面直接卡死。
+# 这里改用 CreateCommand + 逐条设超时，任何一条命令最多等 timeoutSec 秒。
+function Invoke-RemoteCommand($s, [string]$cmdText, [int]$timeoutSec = 60) {
+    $cmd = $null
     try {
-        $r = $s.RunCommand('md5sum -- ' + (Quote-ShArg $path))
-        if ($r.ExitStatus -ne 0) { return $null }
-        $m = [regex]::Match([string]$r.Result, '(?m)^([0-9a-fA-F]{32})\s')
-        if ($m.Success) { return $m.Groups[1].Value.ToUpper() }
-    } catch { }
+        $cmd = $s.CreateCommand($cmdText)
+        try { $cmd.CommandTimeout = [TimeSpan]::FromSeconds($timeoutSec) } catch { }
+        $null = $cmd.Execute()
+        return @{ Ok = $true; Exit = [int]$cmd.ExitStatus; Out = [string]$cmd.Result; Err = [string]$cmd.Error }
+    } catch {
+        return @{ Ok = $false; Exit = -1; Out = ''; Err = $_.Exception.Message }
+    } finally {
+        if ($cmd) { try { $cmd.Dispose() } catch { } }
+    }
+}
+
+# 远程 MD5 缓存：扫描期间同一个文件会被问多次（第 2 级和第 4 级都会问）
+$script:RemoteMd5Cache = @{}
+
+# 解析 md5sum 的输出（一行一个文件）。
+# 抽成纯函数是为了能被单测覆盖 —— 这是远程哈希唯一的解析点，出错会静默判错 mod。
+# 两种格式都要认：文本模式 "hash  路径"，二进制模式 "hash *路径"。
+function ConvertFrom-Md5SumOutput([string]$text) {
+    $map = @{}
+    if (-not $text) { return $map }
+    foreach ($line in @($text -split "`n")) {
+        $m = [regex]::Match([string]$line, '^([0-9a-fA-F]{32})\s+\*?(.+?)\s*$')
+        if ($m.Success) { $map[$m.Groups[2].Value] = $m.Groups[1].Value.ToUpper() }
+    }
+    return $map
+}
+
+# 一次性取回多个远程文件的 MD5 —— 一条 md5sum 命令算一批，而不是一个文件开一次 SSH。
+# 这是性能的关键：411 个 mod 里通常有 350+ 个要算哈希，逐个往返就是几百次 SSH 往返，
+# 界面会像卡死一样（实测就卡在这里）。批量之后通常只发一两次命令。
+function Get-RemoteMd5Map([string[]]$paths) {
+    $map = @{}
+    $list = @($paths | Where-Object { $_ } | Sort-Object -Unique)
+    if ($list.Count -eq 0) { return $map }
+    $s = Get-SshExecSession (Get-CurTarget)
+    if (-not $s) { return $map }
+
+    $i = 0
+    while ($i -lt $list.Count) {
+        # 攒一批，命令行攒到 8KB 就发一次（留足 ARG_MAX 余量）
+        $batch = New-Object System.Collections.ArrayList
+        $len = 0
+        while ($i -lt $list.Count) {
+            $p = [string]$list[$i]
+            if ($batch.Count -gt 0 -and ($len + $p.Length + 4) -gt 8000) { break }
+            [void]$batch.Add($p)
+            $len += $p.Length + 4
+            $i++
+        }
+        $cmd = 'md5sum -- ' + (($batch | ForEach-Object { Quote-ShArg $_ }) -join ' ')
+        # 一批最多 350 个文件、合计可能 1 GB 多，服务器读完要时间 —— 给 180 秒
+        $r = Invoke-RemoteCommand $s $cmd 180
+        if ($r.Ok -and $r.Exit -eq 0) {
+            $parsed = ConvertFrom-Md5SumOutput $r.Out
+            foreach ($k in $parsed.Keys) { $map[$k] = $parsed[$k] }
+        } else {
+            Write-Log ("远程 md5sum 失败（一批 {0} 个文件，exit={1}）：{2}" -f $batch.Count, $r.Exit, $r.Err)
+        }
+    }
+    return $map
+}
+
+# 单个文件的远程 MD5：先查缓存，没有再走批量（批量会把整批结果都塞进缓存）
+function Get-RemoteMd5([string]$path) {
+    if ($script:RemoteMd5Cache.ContainsKey($path)) { return $script:RemoteMd5Cache[$path] }
+    $m = Get-RemoteMd5Map @($path)
+    foreach ($k in $m.Keys) { $script:RemoteMd5Cache[$k] = $m[$k] }
+    if ($m.ContainsKey($path)) { return $m[$path] }
     return $null
 }
 
@@ -2075,10 +2184,8 @@ function Copy-TargetFileInPlace($t, [string]$from, [string]$to) {
     if ($t.Kind -eq 'Local') { Copy-Item -LiteralPath $from -Destination $to -Force; return }
     $s = Get-SshExecSession $t
     if ($s) {
-        try {
-            $r = $s.RunCommand('cp -- ' + (Quote-ShArg $from) + ' ' + (Quote-ShArg $to))
-            if ($r.ExitStatus -eq 0) { return }
-        } catch { }
+        $r = Invoke-RemoteCommand $s ('cp -- ' + (Quote-ShArg $from) + ' ' + (Quote-ShArg $to)) 60
+        if ($r.Ok -and $r.Exit -eq 0) { return }
     }
     $ms = New-Object System.IO.MemoryStream
     try {
@@ -2088,10 +2195,40 @@ function Copy-TargetFileInPlace($t, [string]$from, [string]$to) {
         $c.UploadFile($ms, $to, $true)
     } finally { $ms.Dispose() }
 }
-# 目标端某个文件的 MD5。本地直接算；远程走 md5sum，拿不到就返回 $null（上层退化为只比大小）。
-function Get-TargetFileMd5($t, [string]$path) {
+# 服务器没有命令通道（简幻欢就是这种纯 SFTP chroot）时的兜底：
+# 把这一个文件下到内存里本地算 MD5。**只给"重命名候选"用** ——
+# 那一步的候选通常只有个位数个文件；第 2 级有几百个文件，绝不能走这条路。
+function Get-RemoteMd5ByDownload($t, [string]$path, [long]$maxBytes = 134217728) {
+    try {
+        $c = Connect-SftpTarget $t
+        $size = [long]$c.GetAttributes($path).Size
+        if ($size -gt $maxBytes) {
+            Write-Log ("文件太大，跳过下载取哈希：{0}（{1:N1} MB）" -f $path, ($size / 1MB))
+            return $null
+        }
+        $ms = New-Object System.IO.MemoryStream
+        try {
+            $c.DownloadFile($path, $ms)
+            $md5 = [System.Security.Cryptography.MD5]::Create()
+            try { return ([BitConverter]::ToString($md5.ComputeHash($ms.ToArray()))).Replace('-', '') }
+            finally { $md5.Dispose() }
+        } finally { $ms.Dispose() }
+    } catch {
+        Write-Log ('下载取哈希失败：{0} —— {1}' -f $path, $_.Exception.Message)
+        return $null
+    }
+}
+
+# 目标端某个文件的 MD5。
+# 本地直接算；远程优先走服务器上的 md5sum（零流量），拿不到才看 -AllowDownload：
+#   不给这个开关（第 2 级，几百个文件）→ 返回 $null，上层退化为按大小比对；
+#   给了（第 4 级重命名候选，个位数个文件）→ 下载到内存本地算，把重命名识别救回来。
+function Get-TargetFileMd5($t, [string]$path, [switch]$AllowDownload) {
     if ($t.Kind -eq 'Local') { return (Get-FileHashMd5 $path) }
-    return (Get-RemoteMd5 $path)
+    $h = Get-RemoteMd5 $path
+    if ($h) { return $h }
+    if (-not $AllowDownload) { return $null }
+    return (Get-RemoteMd5ByDownload $t $path)
 }
 
 # 「测试连接」：把能探到的信息一次性告诉用户，出错也给出人话原因
@@ -2109,6 +2246,7 @@ function Test-TargetConnection($t) {
         }
 
         Disconnect-SftpTarget
+        $script:SshExecOk = $null   # 强制重新探测命令通道（用户可能刚给服务器换了配置）
         $c = Connect-SftpTarget $t
         [void]$lines.Add('✅ SFTP 连接成功')
         [void]$lines.Add(("   服务端：{0}" -f $c.ConnectionInfo.ServerVersion))
@@ -2134,8 +2272,8 @@ function Test-TargetConnection($t) {
 
         $s = Get-SshExecSession $t
         if ($s) {
-            $r = $s.RunCommand('command -v md5sum || echo NO_MD5SUM')
-            $hasMd5 = ([string]$r.Result) -notmatch 'NO_MD5SUM'
+            $r = Invoke-RemoteCommand $s 'command -v md5sum || echo NO_MD5SUM' 10
+            $hasMd5 = $r.Ok -and ($r.Out -notmatch 'NO_MD5SUM') -and ($r.Out -match 'md5sum')
             [void]$lines.Add($(if ($hasMd5) {
                 '✅ 服务器有 md5sum —— 内容比对不用把整个整合包下载下来'
             } else {
@@ -2228,6 +2366,7 @@ function Invoke-Scan {
     $script:ScanInProgress = $true
     $script:CancelScan = $false
     $script:HashCache = @{}
+    $script:RemoteMd5Cache = @{}
     $scanSw = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Log ('扫描开始 | 客户端={0} | 目标={1} | 哈希校验={2} | 哈希实现={3}' -f
         $clientDir, (Get-TargetLabel $target), $chkHash.Checked, $script:HashImpl)
@@ -2264,6 +2403,37 @@ function Invoke-Scan {
         $hashCount = 0
         $i = 0
         $total = $srcFiles.Count
+
+        # --- SFTP 目标端：先把"同名同大小"的候选 MD5 一次性批量取回来 ---
+        # 绝不能等到循环里逐个去取：那是几百次 SSH 往返，界面会像卡死一样。
+        # 这里只挑真正需要的（同名 + 同大小），通常 350 个左右，一条命令算完。
+        if ($useHash -and $target.Kind -eq 'Sftp') {
+            $cand = New-Object System.Collections.ArrayList
+            $seenCand = @{}
+            foreach ($f in $srcFiles) {
+                $bid = Get-ModIdentity $f.Name
+                $bkey = $bid.Base.ToLower()
+                if (-not $idxByBase.ContainsKey($bkey)) { continue }
+                $sb = $idxByBase[$bkey][0]
+                if ($sb.Size -ne [long]$f.Length) { continue }
+                if ($seenCand.ContainsKey($sb.Full)) { continue }
+                $seenCand[$sb.Full] = $true
+                [void]$cand.Add($sb.Full)
+            }
+            if ($cand.Count -gt 0) {
+                $lblStatus.Text = "正在批量校验目标端文件内容（$($cand.Count) 个，一条命令算完）..."
+                [System.Windows.Forms.Application]::DoEvents()
+                $md5map = Get-RemoteMd5Map @($cand)
+                foreach ($d in $dstIndexed) {
+                    if ($md5map.ContainsKey($d.Full)) { $d.Hash = $md5map[$d.Full] }
+                }
+                Write-Log ("远程批量哈希：请求 {0} 个，命中 {1} 个" -f $cand.Count, $md5map.Count)
+                if ($md5map.Count -eq 0) {
+                    $lblStatus.Text = '服务器不支持 md5sum，内容比对退化为按文件大小（详见日志）'
+                    [System.Windows.Forms.Application]::DoEvents()
+                }
+            }
+        }
 
         foreach ($f in $srcFiles) {
             if ($script:CancelScan) { break }   # 用户按了 Esc
@@ -2376,6 +2546,27 @@ function Invoke-Scan {
                     if (-not $dstBySize.ContainsKey($szKey)) { $dstBySize[$szKey] = New-Object System.Collections.ArrayList }
                     [void]$dstBySize[$szKey].Add($d)
                 }
+
+                # 第 4 级同样要哈希，同样先批量取回来 —— 别在下面的循环里逐个 SSH
+                if ($target.Kind -eq 'Sftp' -and $script:SshExecOk -ne $false) {
+                    $needH = New-Object System.Collections.ArrayList
+                    foreach ($r in $renSrc) {
+                        $sk = [string]$r.Size
+                        if (-not $dstBySize.ContainsKey($sk)) { continue }
+                        foreach ($d in @($dstBySize[$sk])) {
+                            if (-not $d.Used -and $null -eq $d.Hash) { [void]$needH.Add($d.Full) }
+                        }
+                    }
+                    if ($needH.Count -gt 0) {
+                        $lblStatus.Text = "正在批量校验目标端文件内容（重命名候选 $($needH.Count) 个）..."
+                        [System.Windows.Forms.Application]::DoEvents()
+                        $m4 = Get-RemoteMd5Map @($needH)
+                        foreach ($d in $dstIndexed) {
+                            if ($m4.ContainsKey($d.Full)) { $d.Hash = $m4[$d.Full] }
+                        }
+                    }
+                }
+
                 foreach ($r in $renSrc) {
                     if ($script:CancelScan) { break }
                     $szKey = [string]$r.Size
@@ -2391,7 +2582,15 @@ function Invoke-Scan {
 
                     $hits = New-Object System.Collections.ArrayList
                     foreach ($d in $pool) {
-                        if ($null -eq $d.Hash) { $d.Hash = Get-TargetFileMd5 $target $d.Full }
+                        if ($null -eq $d.Hash) {
+                            # 服务器跑不了 md5sum 时，这里会把候选文件下载下来本地算哈希。
+                            # 候选通常只有个位数个，代价可接受 —— 换来的是"重命名识别"在纯 SFTP 服务器上也能用。
+                            if ($script:SshExecOk -eq $false) {
+                                $lblStatus.Text = "服务器没有 md5sum，正在下载候选文件本地校验：$($d.Name)"
+                                [System.Windows.Forms.Application]::DoEvents()
+                            }
+                            $d.Hash = Get-TargetFileMd5 $target $d.Full -AllowDownload
+                        }
                         if ($d.Hash -and $d.Hash -eq $srcHash) { [void]$hits.Add($d) }
                     }
                     if ($hits.Count -eq 0) { continue }

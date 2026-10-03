@@ -86,6 +86,7 @@ $wanted = @(
     'Get-ServerCounterpartForRecord',
     # 同步目标抽象层（只测本地分支）—— 远程分支要真连服务器，不放进单元测试
     'Normalize-RemoteDir', 'Join-RemotePath', 'ConvertTo-PortOrDefault',
+    'New-SftpTargetFrom', 'ConvertFrom-Md5SumOutput',
     'Test-TargetFile', 'Get-TargetFileSize', 'Get-TargetFileMd5',
     'Get-TargetJarFiles', 'Move-TargetFile', 'Remove-TargetFile',
     'Copy-LocalFileToTarget', 'Copy-TargetFileInPlace'
@@ -354,6 +355,37 @@ try {
         $one = $list | Where-Object { $_.Name -eq 'only-jar.jar' } | Select-Object -First 1
         Assert-True ($null -ne $one.Length) '要有 Length 字段（上层判定依赖它）'
         Assert-True ($null -ne $one.FullName) '要有 FullName 字段'
+    }
+
+    Test-Case 'New-SftpTargetFrom：拼装 SFTP 目标（回归：参数名曾撞上只读变量 $host）' {
+        # 这条是防回归的：早先把参数命名成 $host，撞上 PowerShell 只读内置变量 $Host，
+        # 一点「测试连接」就抛「无法覆盖变量 host」，SFTP 设置对话框直接废掉。
+        $t = New-SftpTargetFrom '  sfe4-connect.simpfun.cn  ' '2095' ' sfe123.abc ' 'pw' '/mods/'
+        Assert-Eq 'sfe4-connect.simpfun.cn' $t.Host '主机要去空白'
+        Assert-Eq 2095 $t.Port '端口'
+        Assert-Eq 'sfe123.abc' $t.User '用户名去空白'
+        Assert-Eq '/mods' $t.Dir '目录要归一化'
+        Assert-Eq 'Sftp' $t.Kind 'Kind'
+        # 端口非法要退回 22，而不是抛异常
+        Assert-Eq 22 (New-SftpTargetFrom 'h' '' 'u' 'p' '').Port '空端口 → 22'
+        Assert-Eq 22 (New-SftpTargetFrom 'h' 'abc' 'u' 'p' '').Port '非法端口 → 22'
+    }
+
+    Test-Case 'ConvertFrom-Md5SumOutput：解析 md5sum 输出（文本/二进制两种格式）' {
+        $out = @(
+            'd41d8cd98f00b204e9800998ecf8427e  /mods/aaa.jar'
+            '0cc175b9c0f1b6a831c399e269772661 */mods/bbb.jar'
+            'qwerty 不是哈希的行应该被忽略'
+            ''
+            '900150983cd24fb0d6963f7d28e17f72  /mods/带 空格的 名字.jar'
+        ) -join "`n"
+        $m = ConvertFrom-Md5SumOutput $out
+        Assert-Eq 3 $m.Count '应解析出 3 条'
+        Assert-Eq 'D41D8CD98F00B204E9800998ECF8427E' $m['/mods/aaa.jar'] '文本模式 + 大写化'
+        Assert-Eq '0CC175B9C0F1B6A831C399E269772661' $m['/mods/bbb.jar'] '二进制模式（带 *）'
+        Assert-Eq '900150983CD24FB0D6963F7D28E17F72' $m['/mods/带 空格的 名字.jar'] '路径含空格'
+        Assert-Eq 0 (ConvertFrom-Md5SumOutput '').Count '空输入 → 空表'
+        Assert-Eq 0 (ConvertFrom-Md5SumOutput $null).Count '$null 输入 → 空表'
     }
 
     # ============================================================== 名字匹配

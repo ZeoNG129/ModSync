@@ -1,6 +1,10 @@
 # AGENTS.md
 
 > 工作区级 AI Agent 指令：Agent 在本工作区内工作前会阅读本文件。
+>
+> 本文件描述的是**开发这台机器上的这份工作区**，里面的绝对路径（`E:\MC\software\ModSync`、
+> `D:\cache\ModSync\`）是实际位置。你 fork 之后请把它们换成自己的目录 ——
+> 脚本本身不依赖任何绝对路径，一律从 `$PSScriptRoot` 推导。
 
 ## 项目概述
 
